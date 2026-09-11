@@ -33,22 +33,31 @@ from tools.android_tool import (
     android_events,
     android_event_stream,
     android_screen_record,
+    android_mic_record,
+    android_mic_stop,
+    android_mic_status,
+    android_mic_fetch,
     android_read_widgets,
     android_media,
     android_search_contacts,
     android_send_intent,
     android_broadcast,
+    android_speak,
+    android_speak_stop,
+    android_find_nodes,
+    android_diff_screen,
+    android_pinch,
     _SCHEMAS,
     _HANDLERS,
 )
 
 
 class TestSchemas:
-    def test_all_38_tools_have_schemas(self):
-        assert len(_SCHEMAS) == 38
+    def test_all_42_tools_have_schemas(self):
+        assert len(_SCHEMAS) == 42
 
-    def test_all_38_tools_have_handlers(self):
-        assert len(_HANDLERS) == 38
+    def test_all_42_tools_have_handlers(self):
+        assert len(_HANDLERS) == 42
 
     def test_schema_names_match_handler_names(self):
         assert set(_SCHEMAS.keys()) == set(_HANDLERS.keys())
@@ -58,6 +67,34 @@ class TestSchemas:
             assert "name" in schema, f"{name} missing 'name'"
             assert "description" in schema, f"{name} missing 'description'"
             assert "parameters" in schema, f"{name} missing 'parameters'"
+
+
+class TestCodeQuality:
+    def test_no_unused_relay_imports_in_setup(self):
+        """Verify android_setup only imports what it uses from android_relay."""
+        import inspect
+        import tools.android_tool as mod
+
+        source = inspect.getsource(mod.android_setup)
+        # is_relay_running was imported but never used — should not appear
+        assert "is_relay_running" not in source, (
+            "is_relay_running is imported but unused in android_setup"
+        )
+        # These should be present (used functions)
+        assert "start_relay" in source
+        assert "is_phone_connected" in source
+
+    def test_plugin_copy_registers_all_tools_without_device_specific_values(self):
+        import runpy
+        from pathlib import Path
+
+        plugin_path = Path(__file__).parents[1] / "hermes-android-plugin" / "android_tool.py"
+        plugin_source = plugin_path.read_text(encoding="utf-8")
+        plugin = runpy.run_path(str(plugin_path))
+
+        assert len(plugin["_SCHEMAS"]) == 42
+        assert set(plugin["_SCHEMAS"]) == set(plugin["_HANDLERS"])
+        assert ("scp " + "-P") not in plugin_source
 
 
 class TestPing:
@@ -104,6 +141,27 @@ class TestReadScreen:
         )
         result = json.loads(android_read_screen(include_bounds=True))
         assert "tree" in result
+
+    @responses.activate
+    def test_read_screen_filters_system_ui_by_default(self, bridge_url):
+        # Issue #34: System UI must be excluded by default for token efficiency.
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/screen",
+            json={"tree": [], "count": 0},
+        )
+        json.loads(android_read_screen())
+        assert "system_ui=false" in responses.calls[0].request.url
+
+    @responses.activate
+    def test_read_screen_includes_system_ui_when_requested(self, bridge_url):
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/screen",
+            json={"tree": [], "count": 0},
+        )
+        json.loads(android_read_screen(include_system_ui=True))
+        assert "system_ui=true" in responses.calls[0].request.url
 
 
 class TestTap:
@@ -321,6 +379,47 @@ class TestSetup:
         assert "localhost" in os.environ.get("ANDROID_BRIDGE_URL", "")
 
 
+class TestEnvFileFallback:
+    """The gateway process may lack ANDROID_* vars in os.environ even though
+    they exist in ~/.hermes/.env.  _bridge_token/_bridge_url must fall back to
+    reading the .env file so the relay still authenticates."""
+
+    def test_token_from_env_file_when_os_environ_empty(self, monkeypatch, tmp_path):
+        from tools import android_tool
+
+        monkeypatch.delenv("ANDROID_BRIDGE_TOKEN", raising=False)
+        monkeypatch.delenv("ANDROID_BRIDGE_URL", raising=False)
+        monkeypatch.setattr(android_tool, "_ENV_FILE_CACHE", None)
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("ANDROID_BRIDGE_TOKEN=SECRET123\nANDROID_BRIDGE_URL=http://1.2.3.4:8766\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        assert android_tool._bridge_token() == "SECRET123"
+        assert android_tool._bridge_url() == "http://1.2.3.4:8766"
+
+    def test_os_environ_wins_over_env_file(self, monkeypatch, tmp_path):
+        from tools import android_tool
+
+        monkeypatch.setenv("ANDROID_BRIDGE_TOKEN", "FROM_ENV")
+        monkeypatch.setattr(android_tool, "_ENV_FILE_CACHE", None)
+        env_file = tmp_path / ".env"
+        env_file.write_text("ANDROID_BRIDGE_TOKEN=FROM_FILE\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        assert android_tool._bridge_token() == "FROM_ENV"
+
+    def test_missing_env_file_returns_none(self, monkeypatch, tmp_path):
+        from tools import android_tool
+
+        monkeypatch.delenv("ANDROID_BRIDGE_TOKEN", raising=False)
+        monkeypatch.setattr(android_tool, "_ENV_FILE_CACHE", None)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "nonexistent"))
+
+        assert android_tool._bridge_token() is None
+        assert android_tool._bridge_url() == "http://localhost:8766"
+
+
 class TestClipboardRead:
     @responses.activate
     def test_clipboard_read(self, bridge_url):
@@ -410,6 +509,24 @@ class TestNotifications:
         )
         result = json.loads(android_notifications(since=1700000000000))
         assert result["count"] == 0
+
+    @responses.activate
+    def test_notifications_include_removed_is_opt_in(self, bridge_url):
+        """#100 follow-up: dismissed notifications only reach the wire on
+        explicit opt-in — the default request must not ask for them."""
+        captured = {}
+
+        def cb(request):
+            captured["url"] = request.url
+            return (200, {}, json.dumps({"notifications": [], "count": 0, "listenerActive": True}))
+
+        responses.add_callback(responses.GET, f"{bridge_url}/notifications", callback=cb)
+
+        json.loads(android_notifications())
+        assert "include_removed" not in captured["url"]
+
+        json.loads(android_notifications(include_removed=True))
+        assert "include_removed=true" in captured["url"]
 
     @responses.activate
     def test_notifications_listener_inactive(self, bridge_url):
@@ -817,6 +934,68 @@ class TestScreenRecord:
         assert "error" in result
 
 
+class TestMicrophone:
+    @responses.activate
+    def test_start_recording(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/mic_start",
+            json={"status": "starting", "duration": 12},
+            status=202,
+        )
+        result = json.loads(android_mic_record(duration=12))
+        assert result == {"status": "starting", "duration": 12}
+        assert json.loads(responses.calls[0].request.body) == {"duration": 12}
+
+    def test_rejects_invalid_duration_without_network_call(self):
+        result = json.loads(android_mic_record(duration=1801))
+        assert "error" in result
+
+    @responses.activate
+    def test_stop_recording(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/mic_stop",
+            json={"status": "stopping"},
+            status=202,
+        )
+        assert json.loads(android_mic_stop())["status"] == "stopping"
+
+    @responses.activate
+    def test_recording_status(self, bridge_url):
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/mic_status",
+            json={"phase": "ready", "recording": False, "latest": "recording_test.wav"},
+        )
+        assert json.loads(android_mic_status())["phase"] == "ready"
+
+    @responses.activate
+    def test_fetch_streams_wav_to_media_path(self, bridge_url):
+        from pathlib import Path
+
+        wav = b"RIFF" + (b"\x00" * 4) + b"WAVE" + (b"\x00" * 52)
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/mic_file",
+            body=wav,
+            status=200,
+            headers={"Content-Type": "audio/wav", "Content-Length": str(len(wav))},
+        )
+
+        result = android_mic_fetch("recording_test.wav")
+        media_path = Path(result.split("MEDIA:", 1)[1])
+        try:
+            assert media_path.read_bytes() == wav
+            assert "name=recording_test.wav" in responses.calls[0].request.url
+        finally:
+            media_path.unlink(missing_ok=True)
+
+    def test_fetch_rejects_device_paths(self):
+        result = json.loads(android_mic_fetch("../recording.wav"))
+        assert "error" in result
+
+
 class TestReadWidgets:
     @responses.activate
     def test_read_widgets(self, bridge_url):
@@ -905,6 +1084,36 @@ class TestSearchContacts:
         result = json.loads(android_search_contacts("test"))
         assert "error" in result
 
+    @responses.activate
+    def test_search_contacts_special_chars_url_encoded(self, bridge_url):
+        """Query strings with special chars (& ? +) must be URL-encoded."""
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/contacts",
+            json={"success": True, "data": {"contacts": [], "count": 0}},
+        )
+        # The ampersand, plus, and space must NOT break the URL
+        result = json.loads(android_search_contacts("Tom & Jerry+Smith"))
+        assert result["success"] is True
+        # Verify the actual request URL has the query properly encoded
+        assert len(responses.calls) == 1
+        request_url = responses.calls[0].request.url
+        assert "query=" in request_url
+        # The raw '&' in the name must be encoded so it doesn't create a new param
+        assert "Tom%20%26%20Jerry%2BSmith" in request_url or "Tom+%26+Jerry%2BSmith" in request_url
+
+    @responses.activate
+    def test_search_contacts_unicode_url_encoded(self, bridge_url):
+        """Unicode query strings must be properly encoded."""
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/contacts",
+            json={"success": True, "data": {"contacts": [], "count": 0}},
+        )
+        result = json.loads(android_search_contacts("José García"))
+        assert result["success"] is True
+        assert len(responses.calls) == 1
+
 
 class TestSendIntent:
     @responses.activate
@@ -959,3 +1168,292 @@ class TestBroadcast:
         )
         result = json.loads(android_broadcast("test"))
         assert "error" in result
+
+
+class TestHTTPErrorPreservation:
+    """Tests that HTTP error response bodies are preserved in error messages."""
+
+    @responses.activate
+    def test_post_preserves_json_error_body(self, bridge_url):
+        """When the bridge returns a JSON error with non-200 status, the error body is preserved."""
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/tap",
+            json={"error": "Node not found: bad_id", "code": "NODE_MISSING"},
+            status=404,
+        )
+        result = json.loads(android_tap(node_id="bad_id"))
+        assert "error" in result
+        # The error message should contain the JSON body from the response
+        assert "Node not found" in str(result["error"])
+
+    @responses.activate
+    def test_get_preserves_json_error_body(self, bridge_url):
+        """When the bridge returns a JSON error on GET, the error body is preserved."""
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/screen",
+            json={"error": "Accessibility service not running", "code": "SERVICE_DOWN"},
+            status=503,
+        )
+        result = json.loads(android_read_screen())
+        assert "error" in result
+        assert "Accessibility service not running" in str(result["error"])
+
+    @responses.activate
+    def test_post_handles_non_json_error(self, bridge_url):
+        """When the bridge returns a non-JSON error, we still get a useful message."""
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/tap",
+            body="Internal Server Error",
+            status=500,
+        )
+        result = json.loads(android_tap(x=100, y=200))
+        assert "error" in result
+
+
+class TestHardwareUnavailable:
+    @responses.activate
+    def test_send_sms_unavailable(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/send_sms",
+            json={"success": False, "error": "SMS not available on this device"},
+            status=200,
+        )
+        result = json.loads(android_send_sms("+1234567890", "test"))
+        assert result["success"] is False
+        assert "not available" in result["error"]
+
+    @responses.activate
+    def test_call_unavailable(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/call",
+            json={"success": False, "error": "Phone calls not available on this device"},
+            status=200,
+        )
+        result = json.loads(android_call("+1234567890"))
+        assert result["success"] is False
+        assert "not available" in result["error"]
+
+    @responses.activate
+    def test_contacts_unavailable(self, bridge_url):
+        responses.add(
+            responses.GET,
+            f"{bridge_url}/contacts",
+            json={"success": False, "error": "Contacts not available on this device"},
+            status=200,
+        )
+        result = json.loads(android_search_contacts("John"))
+        assert result["success"] is False
+        assert "not available" in result["error"]
+class TestSpeak:
+    @responses.activate
+    def test_speak(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/speak",
+            json={"success": True, "message": "Speaking: Hello world"},
+        )
+        result = json.loads(android_speak("Hello world"))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_speak_flush(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/speak",
+            json={"success": True},
+        )
+        result = json.loads(android_speak("Urgent!", flush=True))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_speak_failure(self, bridge_url):
+        responses.add(
+            responses.POST, f"{bridge_url}/speak", body=ConnectionError("refused")
+        )
+        result = json.loads(android_speak("test"))
+        assert "error" in result
+
+
+class TestSpeakStop:
+    @responses.activate
+    def test_speak_stop(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/stop_speaking",
+            json={"success": True, "message": "Speech stopped"},
+        )
+        result = json.loads(android_speak_stop())
+        assert result["success"] is True
+
+    @responses.activate
+    def test_speak_stop_failure(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/stop_speaking",
+            body=ConnectionError("refused"),
+        )
+        result = json.loads(android_speak_stop())
+        assert "error" in result
+
+
+class TestFindNodes:
+    @responses.activate
+    def test_find_nodes_by_text(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/find_nodes",
+            json={
+                "success": True,
+                "nodes": [{"nodeId": "n5", "text": "Login", "clickable": True}],
+                "count": 1,
+            },
+        )
+        result = json.loads(android_find_nodes(text="Login"))
+        assert result["success"] is True
+        assert result["count"] == 1
+
+    @responses.activate
+    def test_find_nodes_by_class(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/find_nodes",
+            json={"success": True, "nodes": [], "count": 0},
+        )
+        result = json.loads(
+            android_find_nodes(class_name="android.widget.Button")
+        )
+        assert result["success"] is True
+
+    @responses.activate
+    def test_find_nodes_clickable(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/find_nodes",
+            json={"success": True, "nodes": [], "count": 0},
+        )
+        result = json.loads(android_find_nodes(clickable=True))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_find_nodes_with_limit(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/find_nodes",
+            json={"success": True, "nodes": [], "count": 0},
+        )
+        result = json.loads(android_find_nodes(text="a", limit=5))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_find_nodes_failure(self, bridge_url):
+        responses.add(
+            responses.POST, f"{bridge_url}/find_nodes", body=ConnectionError("refused")
+        )
+        result = json.loads(android_find_nodes(text="test"))
+        assert "error" in result
+
+
+class TestDiffScreen:
+    @responses.activate
+    def test_diff_screen_changed(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/diff_screen",
+            json={"success": True, "changed": True, "newHash": "def456"},
+        )
+        result = json.loads(android_diff_screen("abc123"))
+        assert result["success"] is True
+        assert result["changed"] is True
+        assert result["newHash"] == "def456"
+
+    @responses.activate
+    def test_diff_screen_unchanged(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/diff_screen",
+            json={"success": True, "changed": False, "newHash": "abc123"},
+        )
+        result = json.loads(android_diff_screen("abc123"))
+        assert result["changed"] is False
+
+    @responses.activate
+    def test_diff_screen_failure(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/diff_screen",
+            body=ConnectionError("refused"),
+        )
+        result = json.loads(android_diff_screen("abc"))
+        assert "error" in result
+
+
+class TestPinch:
+    @responses.activate
+    def test_pinch_zoom_in(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/pinch",
+            json={"success": True, "message": "Pinched at (540, 960) scale=2.0"},
+        )
+        result = json.loads(android_pinch(540, 960, scale=2.0))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_pinch_zoom_out(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/pinch",
+            json={"success": True},
+        )
+        result = json.loads(android_pinch(540, 960, scale=0.5))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_pinch_custom_duration(self, bridge_url):
+        responses.add(
+            responses.POST,
+            f"{bridge_url}/pinch",
+            json={"success": True},
+        )
+        result = json.loads(android_pinch(540, 960, duration=500))
+        assert result["success"] is True
+
+    @responses.activate
+    def test_pinch_failure(self, bridge_url):
+        responses.add(
+            responses.POST, f"{bridge_url}/pinch", body=ConnectionError("refused")
+        )
+        result = json.loads(android_pinch(0, 0))
+        assert "error" in result
+
+
+class TestMicFetchErrorRedaction:
+    """#99: requests exception text embeds the bridge host:port, which tool
+    responses must not expose (AGENTS.md convention)."""
+
+    @responses.activate
+    def test_connection_error_does_not_leak_bridge_url(self, monkeypatch):
+        import requests
+
+        leaked_url = "http://192.168.7.42:8766"
+        monkeypatch.setenv("ANDROID_BRIDGE_URL", leaked_url)
+        responses.add(
+            responses.GET,
+            f"{leaked_url}/mic_file",
+            body=requests.exceptions.ConnectionError(
+                "HTTPConnectionPool(host='192.168.7.42', port=8766): "
+                "Max retries exceeded with url: /mic_file"
+            ),
+        )
+
+        result = json.loads(android_mic_fetch())
+
+        assert "error" in result
+        assert "192.168.7.42" not in result["error"]
+        assert "8766" not in result["error"]
+        assert result["error"] == "Could not download microphone recording from the bridge"

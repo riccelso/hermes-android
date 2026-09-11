@@ -7,17 +7,35 @@ import com.hermesandroid.bridge.service.BridgeAccessibilityService
 
 object ScreenReader {
 
-    fun readCurrentScreen(includeBounds: Boolean): List<ScreenNode> {
+    /** Android System UI package: status bar, navigation bar, etc. Filtered out of
+     *  screen dumps by default for token efficiency. Navigation (back/home/recents)
+     *  is available via android_press_key, so nav-bar nodes aren't needed. */
+    private const val SYSTEM_UI_PACKAGE = "com.android.systemui"
+
+    /**
+     * @param includeBounds include pixel bounds for each node
+     * @param includeSystemUi include System UI nodes (status bar, nav bar).
+     *  Defaults to false: these are non-app chrome that wastes tokens and churns
+     *  screen hashes (clock/battery update every minute).
+     */
+    fun readCurrentScreen(includeBounds: Boolean, includeSystemUi: Boolean = false): List<ScreenNode> {
         val service = BridgeAccessibilityService.instance
             ?: return listOf()
 
-        val roots = service.windows.mapNotNull { it.root }
-        val result = roots.mapIndexed { i, root -> buildNode(root, includeBounds, "$i") }
+        val windows = service.windows
+        val roots = windows.mapNotNull { it.root }
+        val result = roots.mapIndexed { i, root -> buildNode(root, includeBounds, "$i", includeSystemUi) }
+            .filterNotNull()
         roots.forEach { it.recycle() }
+        windows.forEach { it.recycle() }
         return result
     }
 
-    private fun buildNode(info: AccessibilityNodeInfo, includeBounds: Boolean, path: String = "0"): ScreenNode {
+    private fun buildNode(info: AccessibilityNodeInfo, includeBounds: Boolean, path: String = "0", includeSystemUi: Boolean = false): ScreenNode? {
+        // Filter System UI (status bar, nav bar) unless explicitly included.
+        // Returning null drops the whole subtree (status/nav bar live under systemui roots).
+        if (!includeSystemUi && info.packageName?.toString() == SYSTEM_UI_PACKAGE) return null
+
         // Always get bounds for stable ID generation
         val r = android.graphics.Rect()
         info.getBoundsInScreen(r)
@@ -29,7 +47,7 @@ object ScreenReader {
         val children = (0 until info.childCount)
             .mapNotNull { i ->
                 val child = info.getChild(i) ?: return@mapNotNull null
-                val node = buildNode(child, includeBounds, "${path}_$i")
+                val node = buildNode(child, includeBounds, "${path}_$i", includeSystemUi)
                 child.recycle()
                 node
             }
@@ -55,19 +73,30 @@ object ScreenReader {
         exact: Boolean = false
     ): AccessibilityNodeInfo? {
         val service = BridgeAccessibilityService.instance ?: return null
-        val roots = service.windows.mapNotNull { it.root }
+        val windows = service.windows
+        val roots = windows.mapNotNull { it.root }
         var found: AccessibilityNodeInfo? = null
-        for (root in roots) {
+        var foundIndex = -1
+        for ((i, root) in roots.withIndex()) {
             val result = findNodeByTextDfs(root, text, exact)
             if (result != null) {
                 found = result
+                foundIndex = i
                 // Don't recycle root if the found node IS the root
                 if (result !== root) root.recycle()
                 break
             }
             root.recycle()
         }
-        // Recycle remaining roots not yet processed
+        // Recycle remaining unprocessed roots after early break
+        // Guard: when no match is found (foundIndex == -1), all roots were already
+        // recycled in the loop above — the cleanup would re-recycle them.
+        if (foundIndex >= 0) {
+            for (i in (foundIndex + 1) until roots.size) {
+                roots[i].recycle()
+            }
+        }
+        windows.forEach { it.recycle() }
         return found
     }
 
@@ -83,7 +112,11 @@ object ScreenReader {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             val found = findNodeByTextDfs(child, text, exact)
-            if (found != null) return found
+            if (found != null) {
+                // Recycle the intermediate ancestor unless the child itself is the match
+                if (found !== child) child.recycle()
+                return found
+            }
             child.recycle()
         }
         return null
@@ -92,12 +125,14 @@ object ScreenReader {
     fun searchNodes(textFilter: String? = null, classNameFilter: String? = null, clickableFilter: Boolean? = null, limit: Int = 20): List<Map<String, Any?>> {
         val service = BridgeAccessibilityService.instance ?: return emptyList()
         val results = mutableListOf<Map<String, Any?>>()
-        val roots = service.windows.mapNotNull { it.root }
+        val windows = service.windows
+        val roots = windows.mapNotNull { it.root }
         for ((wi, root) in roots.withIndex()) {
             searchNodesDfs(root, textFilter, classNameFilter, clickableFilter, limit, results, "$wi")
             root.recycle()
             if (results.size >= limit) break
         }
+        windows.forEach { it.recycle() }
         return results
     }
 

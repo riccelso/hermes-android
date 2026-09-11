@@ -31,6 +31,23 @@ Tools registered:
   - android_location         get GPS location
   - android_send_sms         send SMS directly
   - android_call             initiate phone call
+  - android_speak            speak text via TTS
+  - android_speak_stop       stop TTS playback
+  - android_events           read recent accessibility events
+  - android_event_stream     enable/disable event capture
+  - android_screen_record    record screen to video
+  - android_mic_record       start microphone WAV recording
+  - android_mic_stop         stop and finalize microphone recording
+  - android_mic_status       inspect microphone recorder state
+  - android_mic_fetch        stream a WAV to a local MEDIA file
+  - android_read_widgets     read home-screen widgets
+  - android_find_nodes       search UI nodes by text/class/clickable
+  - android_diff_screen      diff screen against a previous hash
+  - android_pinch            pinch zoom gesture
+  - android_media            media playback control
+  - android_search_contacts  search phone contacts
+  - android_send_intent      launch an Android intent
+  - android_broadcast        send a broadcast intent
 """
 
 import json
@@ -38,6 +55,7 @@ import os
 import time
 import requests
 from typing import Optional
+from urllib.parse import quote
 
 # ── Config ────────────────────────────────────────────────────────────────────
 #
@@ -50,13 +68,52 @@ from typing import Optional
 # by setting ANDROID_BRIDGE_URL to the phone's IP.
 
 
+_ENV_FILE_CACHE: Optional[dict] = None
+
+
+def _env_file_vars() -> dict:
+    """Parse ~/.hermes/.env once, cached.
+
+    The gateway process does not always export every .env var into os.environ
+    (it loads .env for its own config but the plugin runs in a context where
+    ANDROID_BRIDGE_TOKEN may be missing).  Fall back to reading the file
+    directly so auth works regardless of how the process was started.
+    """
+    global _ENV_FILE_CACHE
+    if _ENV_FILE_CACHE is not None:
+        return _ENV_FILE_CACHE
+    _ENV_FILE_CACHE = {}
+    env_path = os.path.join(
+        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), ".env"
+    )
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                _ENV_FILE_CACHE[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return _ENV_FILE_CACHE
+
+
+def _env(key: str) -> Optional[str]:
+    """os.environ first, then ~/.hermes/.env as a fallback."""
+    val = os.getenv(key)
+    if val:
+        return val
+    return _env_file_vars().get(key)
+
+
 def _bridge_url() -> str:
     """URL of the relay (default) or direct phone connection."""
-    return os.getenv("ANDROID_BRIDGE_URL", "http://localhost:8766")
+    return _env("ANDROID_BRIDGE_URL") or "http://localhost:8766"
 
 
 def _bridge_token() -> Optional[str]:
-    return os.getenv("ANDROID_BRIDGE_TOKEN")
+    return _env("ANDROID_BRIDGE_TOKEN")
 
 
 def _relay_port() -> int:
@@ -89,6 +146,22 @@ def _check_requirements() -> bool:
         return False
 
 
+def _extract_response(r: requests.Response) -> dict:
+    """Extract JSON from a response, preserving error body on HTTP errors."""
+    try:
+        body = r.json()
+    except (ValueError, requests.exceptions.JSONDecodeError):
+        body = {"error": r.text or f"HTTP {r.status_code}"}
+
+    if not r.ok:
+        # If the body doesn't already have an error key, wrap it
+        if "error" not in body:
+            body = {"error": body}
+        raise requests.exceptions.HTTPError(json.dumps(body), response=r)
+
+    return body
+
+
 def _post(path: str, payload: dict) -> dict:
     r = requests.post(
         f"{_bridge_url()}{path}",
@@ -96,16 +169,14 @@ def _post(path: str, payload: dict) -> dict:
         headers=_auth_headers(),
         timeout=_timeout(),
     )
-    r.raise_for_status()
-    return r.json()
+    return _extract_response(r)
 
 
 def _get(path: str) -> dict:
     r = requests.get(
         f"{_bridge_url()}{path}", headers=_auth_headers(), timeout=_timeout()
     )
-    r.raise_for_status()
-    return r.json()
+    return _extract_response(r)
 
 
 # ── Tool implementations ───────────────────────────────────────────────────────
@@ -119,14 +190,21 @@ def android_ping() -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-def android_read_screen(include_bounds: bool = False) -> str:
+def android_read_screen(include_bounds: bool = False, include_system_ui: bool = False) -> str:
     """
     Returns the accessibility tree of the current screen as JSON.
     Each node has: nodeId, text, contentDescription, className,
                    clickable, focusable, bounds (if include_bounds=True)
+
+    System UI (status bar, navigation bar) is excluded by default for token
+    efficiency. Set include_system_ui=True to include it. For navigation, prefer
+    android_press_key("back"|"home"|"recents") — it does not need nav-bar nodes.
     """
     try:
-        data = _get(f"/screen?bounds={str(include_bounds).lower()}")
+        data = _get(
+            f"/screen?bounds={str(include_bounds).lower()}"
+            f"&system_ui={str(include_system_ui).lower()}"
+        )
         return json.dumps(data)
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -212,8 +290,9 @@ def android_open_app(package: str) -> str:
 def android_press_key(key: str) -> str:
     """
     Press a key. Supported keys:
-      back, home, recents, power, volume_up, volume_down,
-      enter, delete, tab, escape, search, notifications
+      back, home, recents, power, notifications,
+      quick_settings, lock_screen, take_screenshot, wake
+    (wake = turn the screen on; power = long-press power menu)
     """
     try:
         data = _post("/press_key", {"key": key})
@@ -335,15 +414,17 @@ def android_clipboard_write(text: str) -> str:
         return json.dumps({"error": str(e)})
 
 
-def android_notifications(limit: int = 50, since: int = 0) -> str:
+def android_notifications(limit: int = 50, since: int = 0, include_removed: bool = False) -> str:
     """
     Read recent notifications from the Android device.
     Requires notification listener permission to be enabled.
     Returns list of notifications with package, title, text, and timestamp.
     Use since (unix ms) to get only notifications after a given time.
+    Dismissed notifications are excluded unless include_removed=true.
     """
     try:
-        data = _get(f"/notifications?limit={limit}&since={since}")
+        removed_param = "&include_removed=true" if include_removed else ""
+        data = _get(f"/notifications?limit={limit}&since={since}{removed_param}")
         return json.dumps(data)
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -452,7 +533,13 @@ def android_macro(steps: list, name: str = "unnamed") -> str:
             )
             results.append({"step": i, "tool": tool_name, "result": result})
 
-            if isinstance(result, dict) and not result.get("success", True):
+            # A failure is either an explicit success=False (action ran but
+            # was rejected) or an "error"-keyed transport/exception result
+            # (no "success" key) — the latter previously defaulted to True and
+            # let the macro silently continue past a real network/JSON error.
+            if isinstance(result, dict) and (
+                result.get("success") is False or "error" in result
+            ):
                 return json.dumps(
                     {
                         "error": f"Step {i} ({tool_name}) failed",
@@ -492,6 +579,7 @@ def android_send_sms(to: str, body: str) -> str:
     """
     Send an SMS message directly without navigating the UI.
     Requires SMS permission on the phone.
+    Destructive action — confirm recipient and message with the user first.
     """
     try:
         data = _post("/send_sms", {"to": to, "body": body})
@@ -504,6 +592,7 @@ def android_call(number: str) -> str:
     """
     Initiate a phone call directly. Requires CALL_PHONE permission.
     The call UI will open on the phone.
+    Destructive action — confirm the number with the user first.
     """
     try:
         data = _post("/call", {"number": number})
@@ -589,6 +678,106 @@ def android_screen_record(duration_ms: int = 5000) -> str:
         return json.dumps({"error": str(e)})
 
 
+def android_mic_record(duration: int = 0) -> str:
+    """Start PCM16/WAV recording; duration=0 records until stopped (30-minute cap)."""
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0 or duration > 1800:
+        return json.dumps({"error": "duration must be between 0 and 1800 seconds"})
+    try:
+        return json.dumps(_post("/mic_start", {"duration": duration}))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def android_mic_stop() -> str:
+    """Stop the active microphone recording and finalize its WAV file."""
+    try:
+        return json.dumps(_post("/mic_stop", {}))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def android_mic_status() -> str:
+    """Return recorder phase plus metadata for the latest completed WAV."""
+    try:
+        return json.dumps(_get("/mic_status"))
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def android_mic_fetch(remote_path: str = "") -> str:
+    """Stream the latest (or named) WAV to a temporary local MEDIA path."""
+    if not isinstance(remote_path, str):
+        return json.dumps({"error": "remote_path must be a WAV filename"})
+    if remote_path and (
+        os.path.basename(remote_path) != remote_path
+        or not remote_path.lower().endswith(".wav")
+    ):
+        return json.dumps({"error": "remote_path must be a WAV filename, not a path"})
+
+    import tempfile
+
+    temp_path = None
+    try:
+        params = {"name": remote_path} if remote_path else None
+        with requests.get(
+            f"{_bridge_url()}/mic_file",
+            params=params,
+            headers=_auth_headers(),
+            timeout=_timeout(),
+            stream=True,
+        ) as response:
+            if response.status_code >= 400:
+                try:
+                    return json.dumps(response.json())
+                except ValueError:
+                    return json.dumps({"error": f"Microphone download failed (HTTP {response.status_code})"})
+
+            expected = response.headers.get("Content-Length")
+            expected_size = int(expected) if expected and expected.isdigit() else None
+            if expected_size is not None and expected_size > 256 * 1024 * 1024:
+                return json.dumps({"error": "Microphone recording exceeds the download limit"})
+
+            written = 0
+            prefix = bytearray()
+            with tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                prefix="android_mic_",
+                delete=False,
+            ) as output:
+                temp_path = output.name
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > 256 * 1024 * 1024:
+                        raise ValueError("Microphone recording exceeds the download limit")
+                    if len(prefix) < 12:
+                        prefix.extend(chunk[: 12 - len(prefix)])
+                    output.write(chunk)
+
+        if expected_size is not None and written != expected_size:
+            raise IOError("Microphone recording download was incomplete")
+        if len(prefix) < 12 or prefix[:4] != b"RIFF" or prefix[8:12] != b"WAVE":
+            raise IOError("Downloaded microphone recording is not a WAV file")
+        return f"Microphone recording fetched ({written} bytes)\nMEDIA:{temp_path}"
+    except requests.exceptions.RequestException:
+        # requests exception text embeds the bridge host:port; tool responses
+        # must not expose device connection details (AGENTS.md convention).
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return json.dumps({"error": "Could not download microphone recording from the bridge"})
+    except Exception as e:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return json.dumps({"error": str(e)})
+
+
 def android_read_widgets() -> str:
     """
     Read home screen widgets (weather, calendar, tasks, etc.) without
@@ -667,7 +856,7 @@ def android_search_contacts(query: str, limit: int = 20) -> str:
     Useful for finding numbers to call or send SMS to.
     """
     try:
-        data = _get(f"/contacts?query={query}&limit={limit}")
+        data = _get(f"/contacts?query={quote(query)}&limit={limit}")
         return json.dumps(data)
     except Exception as e:
         return json.dumps({"error": str(e)})
@@ -774,7 +963,6 @@ def android_setup(pairing_code: str) -> str:
         try:
             from tools.android_relay import (
                 start_relay,
-                is_relay_running,
                 is_phone_connected,
             )
 
@@ -838,6 +1026,11 @@ def _update_env_file(env_path, key: str, value: str):
             lines[-1] += "\n"
         lines.append(f"{key}={value}\n")
     env_path.write_text("".join(lines), encoding="utf-8")
+    # Restrict permissions: .env may contain the pairing token (full device access).
+    try:
+        env_path.chmod(0o600)
+    except OSError:
+        pass
 
 
 # ── Schema definitions ─────────────────────────────────────────────────────────
@@ -850,13 +1043,18 @@ _SCHEMAS = {
     },
     "android_read_screen": {
         "name": "android_read_screen",
-        "description": "Get the accessibility tree of the current Android screen. Returns all visible UI nodes with text, class names, node IDs, and interactability. Use this to understand what's on screen before tapping.",
+        "description": "Get the accessibility tree of the current Android screen. Returns visible app UI nodes with text, class names, node IDs, and interactability. System UI (status bar, nav bar) is excluded by default; set include_system_ui=true to include it. Use this to understand what's on screen before tapping.",
         "parameters": {
             "type": "object",
             "properties": {
                 "include_bounds": {
                     "type": "boolean",
                     "description": "Include pixel coordinates for each node. Default false.",
+                    "default": False,
+                },
+                "include_system_ui": {
+                    "type": "boolean",
+                    "description": "Include System UI nodes (status bar, navigation bar). Default false (excluded) to save tokens. Use android_press_key for back/home/recents.",
                     "default": False,
                 }
             },
@@ -957,14 +1155,11 @@ _SCHEMAS = {
                         "home",
                         "recents",
                         "power",
-                        "volume_up",
-                        "volume_down",
-                        "enter",
-                        "delete",
-                        "tab",
-                        "escape",
-                        "search",
                         "notifications",
+                        "quick_settings",
+                        "lock_screen",
+                        "take_screenshot",
+                        "wake",
                     ],
                 }
             },
@@ -973,7 +1168,7 @@ _SCHEMAS = {
     },
     "android_screenshot": {
         "name": "android_screenshot",
-        "description": "Take a screenshot of the current Android screen. Returns base64 PNG. Use when the accessibility tree is missing context or the screen uses canvas/game rendering.",
+        "description": "Take a screenshot of the current Android screen. Returns base64 PNG. Do NOT use this to find UI elements — call android_read_screen or android_find_nodes first to get exact element text and node IDs. Use screenshots only to show the user the screen, verify visual layout, or when the screen uses canvas/game rendering that the accessibility tree cannot read.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     "android_scroll": {
@@ -1075,6 +1270,11 @@ _SCHEMAS = {
                     "type": "integer",
                     "description": "Only return notifications after this Unix timestamp in milliseconds (default 0 = all)",
                     "default": 0,
+                },
+                "include_removed": {
+                    "type": "boolean",
+                    "description": "Include notifications the user has dismissed/cleared (default false). Opt-in because cleared notifications may contain content the user has already acted on.",
+                    "default": False,
                 },
             },
             "required": [],
@@ -1271,6 +1471,49 @@ _SCHEMAS = {
             "required": [],
         },
     },
+    "android_mic_record": {
+        "name": "android_mic_record",
+        "description": "Start a 16 kHz mono WAV microphone recording on the Android device.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "duration": {
+                    "type": "integer",
+                    "description": "Seconds to record (0 records until android_mic_stop, capped at 1800; maximum 1800)",
+                    "minimum": 0,
+                    "maximum": 1800,
+                    "default": 0,
+                },
+            },
+            "required": [],
+        },
+    },
+    "android_mic_stop": {
+        "name": "android_mic_stop",
+        "description": "Stop the active microphone recording and finalize its WAV file.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "android_mic_status": {
+        "name": "android_mic_status",
+        "description": "Get microphone recorder state and latest completed WAV metadata.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "android_mic_fetch": {
+        "name": "android_mic_fetch",
+        "description": "Download the latest or named microphone WAV as a local MEDIA file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "remote_path": {
+                    "type": "string",
+                    "description": "Optional WAV filename returned by android_mic_status; paths are rejected",
+                    "default": "",
+                },
+            },
+            "required": [],
+        },
+    },
+
     "android_read_widgets": {
         "name": "android_read_widgets",
         "description": "Read home screen widgets (weather, calendar, tasks, etc.). Goes to home screen and reads widget content without opening apps.",
@@ -1449,6 +1692,10 @@ _HANDLERS = {
     "android_events": lambda args, **kw: android_events(**args),
     "android_event_stream": lambda args, **kw: android_event_stream(**args),
     "android_screen_record": lambda args, **kw: android_screen_record(**args),
+    "android_mic_record": lambda args, **kw: android_mic_record(**args),
+    "android_mic_stop": lambda args, **kw: android_mic_stop(),
+    "android_mic_status": lambda args, **kw: android_mic_status(),
+    "android_mic_fetch": lambda args, **kw: android_mic_fetch(**args),
     "android_read_widgets": lambda args, **kw: android_read_widgets(),
     "android_find_nodes": lambda args, **kw: android_find_nodes(**args),
     "android_diff_screen": lambda args, **kw: android_diff_screen(**args),

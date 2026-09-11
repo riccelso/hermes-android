@@ -1,46 +1,34 @@
-# hermes-android
+# AGENTS.md
 
-## Overview
-This extension adds Android device control to hermes-agent via the `android` toolset.
-It communicates with a bridge app running on an Android device over HTTP.
+READ ./.agents/AGENTS.base.md BEFORE ANYTHING (skip if missing).
 
-## Setup
-1. Install the bridge APK on the Android device
-2. Grant the bridge app Accessibility Service permission in Settings > Accessibility
-3. Grant SYSTEM_ALERT_WINDOW permission
-4. Set ANDROID_BRIDGE_URL in ~/.hermes/.env (only needed for direct USB/LAN connection):
-   - Same WiFi: `ANDROID_BRIDGE_URL=http://192.168.x.x:8765`
-   - USB (recommended): run `adb forward tcp:8765 tcp:8765` then use `http://localhost:8765`
-   - Remote relay (default): no config needed — `android_setup` starts a relay on port 8766
-5. Install the Python package: `pip install -e ./hermes-android`
-6. Add to hermes-agent model_tools.py _modules: `"tools.android_tool"`
-7. Add "android" toolset to toolsets.py
+Repo-specific hard rules only. Shared rules (Reviews, PR/CI, Git, Runtime Safety,
+generic Project Defaults, Workflows) live in `AGENTS.base.md` — not duplicated here.
 
-## Tool usage patterns
+## Core
+- Repo: hermes-android. Two components: Kotlin bridge app (`hermes-android-bridge/`) + Python toolset (`tools/`, `tests/`, `hermes-android-plugin/`).
+- Python prod copy lives in hermes-agent repo; this repo = standalone dev/test. APK does NOT depend on Python.
+- Branch `main`. pyproject version 0.5.0.
+- Shipped = git tag (`latest-build` APK + version tag), not main merge.
+- Confidentiality: this is a remote-control bridge — security-sensitive. Full device access once paired. Never expose pairing codes, server IPs, tokens, screen content, screenshots, contacts/SMS/location data outside the task. See SECURITY.md.
 
-### Read before act
-ALWAYS call android_read_screen before tapping. Never guess coordinates.
+## Routing
+- Screenshots/media: tools return `MEDIA:<path>` (temp files) — relay to user, don't persist.
+- Secrets: `~/.hermes/.env` (`ANDROID_BRIDGE_URL`, `ANDROID_BRIDGE_TOKEN`). Never echo/dump env. Never log pairing codes or tokens.
+- Test the bridge against a real device or relay; no test accounts baked in.
+- Direct USB/LAN dev → phone Ktor server port 8765. Relay (default) → port 8766.
 
-### Prefer text over coordinates
-Use android_tap_text("Continue") over android_tap(x=540, y=1200).
+## Project Defaults (repo-specific)
+- Runtimes: Gradle (Kotlin bridge), Python >=3.11 (toolset).
+- Bug-fix regression tests → Python: `tests/`; Kotlin: bridge unit tests.
+- New-dep health check sources: pyproject.toml / Gradle.
+- PII: strip phone numbers, recipients, location from tool responses/logs (existing convention — keep it).
 
-### Wait after navigation
-After opening an app or tapping a button that triggers loading,
-always call android_wait with expected text before next action.
+## PR / CI (repo-specific)
+- Every push to `main` auto-publishes a debug APK to the `latest-build` release.
 
-### Confirmation pattern for destructive actions
-Before confirming a purchase, ride, or send action — always report
-to the user what you're about to do and wait for approval.
-Example: "I'm about to confirm an Uber ride to [destination] for [price].
-Reply 'yes' to confirm."
+## Git (repo-specific)
+- Common commit scope: `(bridge)`.
 
-## Common package names
-- com.ubercab — Uber
-- com.bolt.client — Bolt
-- com.whatsapp — WhatsApp
-- com.spotify.music — Spotify
-- com.google.android.apps.maps — Google Maps
-- com.android.chrome — Chrome
-- com.google.android.gm — Gmail
-- com.instagram.android — Instagram
-- com.twitter.android — X/Twitter
+## Runtime Safety (repo-specific)
+- Destructive on-device actions (purchases, sends, calls, deletions) → confirm with user before executing.

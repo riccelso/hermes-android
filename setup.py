@@ -2,7 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="hermes-android",
-    version="0.3.0",
+    version="0.5.0",
+    license="MIT",
     packages=find_packages(),
     install_requires=[
         "requests>=2.28.0",

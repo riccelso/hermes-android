@@ -3,24 +3,23 @@ package com.hermesandroid.bridge.client
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.hermesandroid.bridge.BridgeApplication
+import com.hermesandroid.bridge.BuildConfig
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
-import com.hermesandroid.bridge.executor.ActionExecutor
-import com.hermesandroid.bridge.media.ScreenRecorder
-import com.hermesandroid.bridge.model.ScreenNode
-import com.hermesandroid.bridge.executor.ScreenReader
-import com.hermesandroid.bridge.event.EventStore
-import com.hermesandroid.bridge.notification.NotificationStore
+import com.hermesandroid.bridge.audio.MicrophoneRecordingFiles
+import com.hermesandroid.bridge.server.CommandDispatcher
 import com.hermesandroid.bridge.service.BridgeAccessibilityService
-import com.hermesandroid.bridge.service.BridgeNotificationListener
-import com.hermesandroid.bridge.BuildConfig
 import kotlinx.coroutines.*
 import okhttp3.*
+import okio.ByteString.Companion.toByteString
+import java.io.FileInputStream
+import java.security.MessageDigest
 
 /**
  * WebSocket client that connects OUT to the Hermes relay server.
- * Receives commands over WebSocket, dispatches them to ActionExecutor/ScreenReader,
+ * Receives commands over WebSocket, dispatches them to [CommandDispatcher],
  * and sends results back.
  *
  * Auto-reconnects on disconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s).
@@ -34,6 +33,16 @@ object RelayClient {
     private const val MAX_BACKOFF_MS = 30_000L
     private const val MAX_RETRIES = 5
 
+    // --- Termux revival watchdog ---
+    // When the relay is unreachable past these thresholds, fire the
+    // Termux RUN_COMMAND intent to restart the whole stack (start-zee.sh).
+    private const val WATCHDOG_FAILURES_TO_TRIGGER = 3
+    private const val WATCHDOG_COOLDOWN_MS = 600_000L  // 10 min
+    private val revivalPolicy = RevivalPolicy(WATCHDOG_FAILURES_TO_TRIGGER, WATCHDOG_COOLDOWN_MS)
+    private const val KEY_FAILURES = "watchdog_failures"
+    private const val KEY_LAST_FIRE = "watchdog_last_fire_ms"
+    private const val KEY_REVIVAL_ENABLED = "termux_revival_enabled"
+
     private val gson = Gson()
     private val client = OkHttpClient.Builder()
         .pingInterval(java.time.Duration.ofSeconds(20))
@@ -43,6 +52,21 @@ object RelayClient {
     private var scope: CoroutineScope? = null
     private var reconnectJob: Job? = null
     private var prefs: SharedPreferences? = null
+    private var appContext: Context? = null
+    private val reconnectPolicy = ReconnectPolicy(maxRetries = MAX_RETRIES, maxBackoffMs = MAX_BACKOFF_MS)
+
+    /** True between scheduling a reconnect and that attempt firing. Guards against
+     *  onClosed + onFailure both scheduling for the same dead connection. */
+    @Volatile
+    private var reconnectPending: Boolean = false
+
+    /** Bumped per connect attempt; callbacks from superseded sockets are ignored. */
+    @Volatile
+    private var generation: Int = 0
+
+    /** `System.nanoTime()` at the last onOpen, or 0 when no session is open. */
+    @Volatile
+    private var sessionStartedNs: Long = 0L
 
     @Volatile
     var isConnected: Boolean = false
@@ -64,23 +88,35 @@ object RelayClient {
 
     fun init(context: Context) {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        appContext = context.applicationContext
     }
 
+    // Shares the monitor with scheduleReconnect/beginReconnectAttempt: these run
+    // on the main thread while callbacks schedule reconnects on OkHttp threads,
+    // and an interleaving there can strand reconnectPending set with no
+    // coroutine left to clear it, killing auto-reconnect for the process.
+    @Synchronized
     fun connect(serverUrl: String, pairingCode: String) {
         disconnect()
 
         this.serverUrl = serverUrl
         this.pairingCode = pairingCode
         shouldReconnect = true
+        reconnectPolicy.reset()
 
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         doConnect(serverUrl, pairingCode)
     }
 
+    @Synchronized
     fun disconnect() {
         shouldReconnect = false
         reconnectJob?.cancel()
         reconnectJob = null
+        reconnectPending = false
+        reconnectPolicy.reset()
+        sessionStartedNs = 0L
+        generation++
         webSocket?.close(1000, "Client disconnecting")
         webSocket = null
         scope?.cancel()
@@ -101,20 +137,38 @@ object RelayClient {
     }
 
     private fun doConnect(serverUrl: String, pairingCode: String) {
-        val wsUrl = buildWsUrl(serverUrl, pairingCode)
+        val myGeneration = ++generation
+        val wsUrl = buildWsUrl(serverUrl)
         Log.i(TAG, "Connecting to $wsUrl")
         notifyStatus(false, "Connecting to $wsUrl ...")
 
+        // Token goes in the Authorization header, not the URL — query strings
+        // end up verbatim in reverse-proxy access logs.
         val request = Request.Builder()
             .url(wsUrl)
+            .header("Authorization", "Bearer $pairingCode")
             .build()
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(TAG, "WebSocket connected to $wsUrl")
+                if (myGeneration != generation) {
+                    webSocket.cancel()
+                    return
+                }
+                Log.i(TAG, "WebSocket connected to ${buildWsUrl(serverUrl)}")
                 isConnected = true
-                BridgeAccessibilityService.instance?.startForeground()
+                // success resets the revival watchdog
+                prefs?.edit()?.putInt(KEY_FAILURES, 0)?.apply()
+                // NOT a policy reset: the budget is only refilled once this
+                // session proves stable (see endSession), so a relay that
+                // accepts and instantly drops us can't retry forever.
+                sessionStartedNs = System.nanoTime()
+                try {
+                    BridgeAccessibilityService.instance?.startForeground()
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Could not promote bridge service to foreground", e)
+                }
                 notifyStatus(true, "Connected to $serverUrl")
             }
 
@@ -130,55 +184,180 @@ object RelayClient {
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (myGeneration != generation) return
                 Log.i(TAG, "WebSocket closed: $code $reason")
                 isConnected = false
+                endSession()
                 notifyStatus(false, "Closed: code=$code $reason")
                 scheduleReconnect()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (myGeneration != generation) return
                 val httpCode = response?.code ?: 0
                 val errorDetail = "Error: ${t.javaClass.simpleName}: ${t.message} (HTTP $httpCode)"
                 Log.e(TAG, "WebSocket failure: $errorDetail", t)
                 isConnected = false
+                endSession()
                 notifyStatus(false, errorDetail)
                 scheduleReconnect()
             }
         })
     }
 
+    // Invoked from OkHttp callback threads; the policy and the pending flag are
+    // read-modify-written together, so serialize the whole decision.
+    @Synchronized
     private fun scheduleReconnect() {
         if (!shouldReconnect) return
         val url = serverUrl ?: return
         val code = pairingCode ?: return
+        // Resolve the scope BEFORE burning budget or raising reconnectPending:
+        // a late callback after disconnect() finds a null scope, and committing
+        // that state with no coroutine to clear it would stall reconnects for good.
+        val activeScope = scope ?: return
 
-        reconnectJob?.cancel()
-        reconnectJob = scope?.launch {
-            var backoff = 1000L
-            var retries = 0
-            while (shouldReconnect && !isConnected && retries < MAX_RETRIES) {
-                retries++
-                Log.i(TAG, "Reconnecting in ${backoff}ms... (attempt $retries/$MAX_RETRIES)")
-                notifyStatus(false, "Reconnecting in ${backoff / 1000}s... (attempt $retries/$MAX_RETRIES)")
-                delay(backoff)
-                if (shouldReconnect && !isConnected) {
-                    doConnect(url, code)
-                    delay(3000)
-                    if (!isConnected) {
-                        backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
-                    } else {
-                        break
-                    }
+        // onClosed and onFailure can both fire for one dead socket; only one of
+        // them should turn into an attempt. This must come BEFORE the exhausted
+        // check: otherwise the second callback sees the budget the first one
+        // just spent and declares failure while that final attempt is still
+        // waiting out its backoff, silently skipping the last retry.
+        if (reconnectPending) return
+
+        // Each failed attempt fires onFailure/onClosed, which lands back here.
+        // Bail out once the shared attempt budget is spent — otherwise an
+        // unreachable address reconnects forever.
+        if (reconnectPolicy.isExhausted) {
+            shouldReconnect = false
+            reconnectPending = false
+            // Retire the dead socket's listener too, otherwise a late callback
+            // from it overwrites the terminal status the user needs to see.
+            generation++
+            // Its onClosed/onFailure will now be ignored, so drop the session
+            // clock here — a stale start time would otherwise make the NEXT
+            // session look long enough to refill the retry budget.
+            sessionStartedNs = 0L
+            webSocket?.cancel()
+            webSocket = null
+            notifyStatus(false, "Failed to connect after ${reconnectPolicy.limit} attempts. Tap Connect to retry.")
+            maybeFireTermuxRevival()
+            return
+        }
+
+        reconnectPending = true
+
+        val backoff = reconnectPolicy.nextBackoffMs()
+        val attempt = reconnectPolicy.attempts
+
+        reconnectJob = activeScope.launch {
+            Log.i(TAG, "Reconnecting in ${backoff}ms... (attempt $attempt/${reconnectPolicy.limit})")
+            notifyStatus(false, "Reconnecting in ${backoff / 1000}s... (attempt $attempt/${reconnectPolicy.limit})")
+            delay(backoff)
+            beginReconnectAttempt(url, code)
+        }
+    }
+
+    /**
+     * Clearing [reconnectPending] and starting the attempt must happen as one
+     * step under the same monitor as [scheduleReconnect]; clearing it earlier
+     * lets a callback slip through and launch a second reconnect coroutine.
+     */
+    @Synchronized
+    private fun beginReconnectAttempt(url: String, code: String) {
+        reconnectPending = false
+        if (!shouldReconnect || isConnected) return
+        // Supersede the old listener BEFORE cancelling its socket: cancel()
+        // drives that listener's onFailure, and if it still matched the current
+        // generation it would re-enter scheduleReconnect and burn an attempt on
+        // our own teardown.
+        generation++
+        // Retired listener => no endSession() for it; drop the clock so the
+        // next session is measured from its own start, not this one's.
+        sessionStartedNs = 0L
+        // Cancel the previous WebSocket before opening a new one, otherwise its
+        // listener stays active and can fire out-of-order callbacks
+        // (onOpen/onFailure) that set isConnected or push duplicate statuses.
+        webSocket?.cancel()
+        doConnect(url, code)
+    }
+
+    /** A session that had opened is over — refill the budget only if it was stable. */
+    private fun endSession() {
+        val startedNs = sessionStartedNs
+        if (startedNs == 0L) return
+        sessionStartedNs = 0L
+        reconnectPolicy.onSessionEnded((System.nanoTime() - startedNs) / 1_000_000L)
+    }
+
+    /**
+     * Termux revival watchdog: after repeated relay connection failures
+     * (Termux stack likely dead), fire the RUN_COMMAND intent to restart
+     * the whole stack via start-zee.sh. Cooldown prevents loops.
+     */
+    private fun maybeFireTermuxRevival() {
+        val p = prefs ?: return
+        val enabled = p.getBoolean(KEY_REVIVAL_ENABLED, false)
+        val failures = p.getInt(KEY_FAILURES, 0)
+        val lastFire = p.getLong(KEY_LAST_FIRE, 0L)
+        val now = System.currentTimeMillis()
+        when (val d = revivalPolicy.onFailure(enabled, failures, lastFire, now)) {
+            is RevivalPolicy.Decision.Wait -> {
+                p.edit().putInt(KEY_FAILURES, d.failures).apply()
+                if (d.failures > failures) {
+                    Log.i(TAG, "Revival watchdog: ${d.failures}/$WATCHDOG_FAILURES_TO_TRIGGER failures")
                 }
             }
-            if (!isConnected && retries >= MAX_RETRIES) {
-                notifyStatus(false, "Failed to connect after $MAX_RETRIES attempts. Tap Connect to retry.")
-                shouldReconnect = false
+            is RevivalPolicy.Decision.Fire -> {
+                p.edit().putInt(KEY_FAILURES, 0).putLong(KEY_LAST_FIRE, now).apply()
+                fireTermuxRestart()
             }
         }
     }
 
-    private fun buildWsUrl(serverUrl: String, pairingCode: String): String {
+    private fun fireTermuxRestart() {
+        val ctx = appContext ?: return
+        try {
+            val intent = android.content.Intent("com.termux.RUN_COMMAND").apply {
+                setClassName("com.termux", "com.termux.app.RunCommandService")
+                putExtra("com.termux.RUN_COMMAND_PATH",
+                    "/data/data/com.termux/files/home/.termux/boot/start-zee.sh")
+                putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
+                putExtra("com.termux.RUN_COMMAND_SESSION_ACTION", 0)
+            }
+            ctx.startService(intent)
+            Log.i(TAG, "Termux revival: RUN_COMMAND fired (start-zee.sh)")
+            notifyStatus(false, "Stack unreachable — firing Termux revival…")
+            // The watchdog fired but the app itself must keep trying to
+            // reconnect: without this the relay stays dark even after a
+            // successful revival (review point: "fires but never reconnects").
+            reconnectDelayed()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Termux revival BLOCKED: RUN_COMMAND permission missing", e)
+            notifyStatus(false, "Revival blocked — allow Termux RUN_COMMAND (Termux > Allow external apps)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Termux revival intent failed", e)
+            notifyStatus(false, "Revival failed: ${e.message?.take(80) ?: "unknown error"}")
+        }
+    }
+
+    private fun reconnectDelayed() {
+        try {
+            val url = prefs?.getString(KEY_SERVER_URL, null)
+            val code = prefs?.getString(KEY_PAIRING_CODE, null)
+            if (url.isNullOrBlank() || code.isNullOrBlank()) {
+                Log.w(TAG, "Delayed reconnect skipped: no saved server/code")
+                return
+            }
+            scope?.launch {
+                kotlinx.coroutines.delay(30_000L)  // 30s later, bounded by the same cooldown
+                connect(url, code)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Delayed reconnect not scheduled: $e")
+        }
+    }
+
+    private fun buildWsUrl(serverUrl: String): String {
         val trimmed = serverUrl.trim().trimEnd('/')
         val useTls = trimmed.startsWith("https://") || trimmed.startsWith("wss://")
         var base = trimmed
@@ -188,9 +367,8 @@ object RelayClient {
             base = "$base:8766"
         }
         val scheme = if (useTls) "wss" else "ws"
-        val url = "$scheme://$base/ws?token=***"
-        Log.i(TAG, "Built WebSocket URL: $scheme://$base/ws?token=***")
-        return "$scheme://$base/ws?token=$pairingCode"
+        if (BuildConfig.DEBUG) Log.d(TAG, "Built WebSocket URL: $scheme://$base/ws")
+        return "$scheme://$base/ws"
     }
 
     private suspend fun handleMessage(ws: WebSocket, text: String) {
@@ -202,9 +380,23 @@ object RelayClient {
             val params = json.getAsJsonObject("params") ?: JsonObject()
             val body = json.getAsJsonObject("body") ?: JsonObject()
 
-            Log.d(TAG, "Received command: $method $path (id=$requestId)")
+            if (BuildConfig.DEBUG) Log.d(TAG, "Received command: $method $path (id=$requestId)")
 
-            val response = dispatchCommand(method, path, params, body)
+            if (requestId.isBlank()) {
+                throw IllegalArgumentException("Command is missing request_id")
+            }
+            if (method == "GET" && path == "/mic_file") {
+                streamMicrophoneRecording(
+                    ws,
+                    requestId,
+                    params.get("name")?.asString,
+                )
+                return
+            }
+
+            // The relay connection is authenticated at connect time (Bearer token on the WS handshake),
+            // so commands arriving here are already authenticated.
+            val response = CommandDispatcher.dispatch(method, path, params, body, authenticated = true)
 
             val responseJson = JsonObject().apply {
                 addProperty("request_id", requestId)
@@ -227,331 +419,121 @@ object RelayClient {
         }
     }
 
-    /**
-     * Dispatch a command to the appropriate handler. Returns (result, statusCode).
-     */
-    private suspend fun dispatchCommand(
-        method: String,
-        path: String,
-        params: JsonObject,
-        body: JsonObject
-    ): Pair<Any, Int> {
-        return when {
-            method == "GET" && path == "/ping" -> {
-                val serviceRunning = BridgeAccessibilityService.instance != null
-                mapOf(
-                    "status" to "ok",
-                    "accessibilityService" to serviceRunning,
-                    "authenticated" to true,
-                    "version" to BuildConfig.VERSION_NAME
-                ) to 200
-            }
+    private suspend fun streamMicrophoneRecording(
+        ws: WebSocket,
+        requestId: String,
+        requestedName: String?,
+    ) {
+        val file = MicrophoneRecordingFiles.resolve(
+            BridgeApplication.instance,
+            requestedName,
+        )
+        if (file == null) {
+            sendCommandResult(
+                ws,
+                requestId,
+                mapOf("error" to "Recording not found"),
+                status = 404,
+            )
+            return
+        }
 
-            method == "GET" && path == "/screen" -> {
-                val bounds = params.get("bounds")?.asString == "true"
-                val tree = withContext(Dispatchers.Main) {
-                    ScreenReader.readCurrentScreen(bounds)
+        val startMessage = JsonObject().apply {
+            addProperty("request_id", requestId)
+            addProperty("status", 200)
+            add("stream", JsonObject().apply {
+                addProperty("event", "start")
+                addProperty("filename", file.name)
+                addProperty("mimeType", "audio/wav")
+                addProperty("size", file.length())
+            })
+        }
+        if (!ws.send(startMessage.toString())) return
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        var bytesSent = 0L
+        try {
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (read == 0) continue
+
+                    while (ws.queueSize() > 1024L * 1024L) {
+                        delay(10L)
+                    }
+                    digest.update(buffer, 0, read)
+                    if (!ws.send(buildStreamFrame(requestId, buffer, read))) {
+                        throw IllegalStateException("WebSocket rejected microphone stream data")
+                    }
+                    bytesSent += read
                 }
-                mapOf("tree" to tree, "count" to countAllNodes(tree)) to 200
             }
 
-            method == "POST" && path == "/tap" -> {
-                val x = body.get("x")?.asInt
-                val y = body.get("y")?.asInt
-                val nodeId = body.get("nodeId")?.asString
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.tap(x, y, nodeId)
-                }
-                result to 200
+            val endMessage = JsonObject().apply {
+                addProperty("request_id", requestId)
+                addProperty("status", 200)
+                add("stream", JsonObject().apply {
+                    addProperty("event", "end")
+                    addProperty("bytes", bytesSent)
+                    addProperty(
+                        "sha256",
+                        digest.digest().joinToString("") { byte ->
+                            "%02x".format(byte.toInt() and 0xff)
+                        },
+                    )
+                })
             }
-
-            method == "POST" && path == "/tap_text" -> {
-                val text = body.get("text")?.asString ?: ""
-                val exact = body.get("exact")?.asBoolean ?: false
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.tapText(text, exact)
-                }
-                result to 200
+            ws.send(endMessage.toString())
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            val errorMessage = JsonObject().apply {
+                addProperty("request_id", requestId)
+                addProperty("status", 500)
+                add("stream", JsonObject().apply {
+                    addProperty("event", "error")
+                    addProperty("message", "Microphone stream failed (${error.javaClass.simpleName})")
+                })
             }
-
-            method == "POST" && path == "/type" -> {
-                val text = body.get("text")?.asString ?: ""
-                val clearFirst = body.get("clearFirst")?.asBoolean ?: false
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.typeText(text, clearFirst)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/swipe" -> {
-                val direction = body.get("direction")?.asString ?: ""
-                val distance = body.get("distance")?.asString ?: "medium"
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.swipe(direction, distance)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/open_app" -> {
-                val pkg = body.get("package")?.asString
-                    ?: return mapOf("error" to "Missing package") to 400
-                val result = ActionExecutor.openApp(pkg)
-                result to 200
-            }
-
-            method == "POST" && path == "/press_key" -> {
-                val key = body.get("key")?.asString ?: ""
-                val result = ActionExecutor.pressKey(key)
-                result to 200
-            }
-
-            method == "GET" && path == "/screenshot" -> {
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.takeScreenshot()
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/scroll" -> {
-                val direction = body.get("direction")?.asString ?: ""
-                val nodeId = body.get("nodeId")?.asString
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.scroll(direction, nodeId)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/wait" -> {
-                val text = body.get("text")?.asString
-                val className = body.get("className")?.asString
-                val timeoutMs = body.get("timeoutMs")?.asInt ?: 5000
-                val result = ActionExecutor.waitForElement(text, className, timeoutMs)
-                result to 200
-            }
-
-            method == "GET" && path == "/apps" -> {
-                val apps = ActionExecutor.getInstalledApps()
-                mapOf("apps" to apps, "count" to apps.size) to 200
-            }
-
-            method == "GET" && path == "/current_app" -> {
-                val result = withContext(Dispatchers.Main) {
-                    val service = BridgeAccessibilityService.instance
-                    val root = service?.windows?.firstOrNull()?.root
-                    val pkg = root?.packageName?.toString() ?: "unknown"
-                    val cls = root?.className?.toString() ?: "unknown"
-                    root?.recycle()
-                    mapOf("package" to pkg, "className" to cls)
-                }
-                result to 200
-            }
-
-            method == "GET" && path == "/clipboard" -> {
-                val result = ActionExecutor.clipboardRead()
-                result to 200
-            }
-
-            method == "POST" && path == "/clipboard" -> {
-                val text = body.get("text")?.asString ?: ""
-                val result = ActionExecutor.clipboardWrite(text)
-                result to 200
-            }
-
-            method == "GET" && path == "/notifications" -> {
-                val limit = params.get("limit")?.asString?.toIntOrNull() ?: 50
-                val since = params.get("since")?.asString?.toLongOrNull() ?: 0L
-                val entries = if (since > 0) {
-                    NotificationStore.getSince(since, limit)
-                } else {
-                    NotificationStore.getAll(limit)
-                }
-                val mapped = entries.map { NotificationStore.toMap(it) }
-                val listenerRunning = BridgeNotificationListener.instance != null
-                mapOf(
-                    "notifications" to mapped,
-                    "count" to mapped.size,
-                    "listenerActive" to listenerRunning
-                ) to 200
-            }
-
-            method == "POST" && path == "/long_press" -> {
-                val x = body.get("x")?.asInt
-                val y = body.get("y")?.asInt
-                val nodeId = body.get("nodeId")?.asString
-                val duration = body.get("duration")?.asLong ?: 500L
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.longPress(x, y, nodeId, duration)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/drag" -> {
-                val startX = body.get("startX")?.asInt ?: 0
-                val startY = body.get("startY")?.asInt ?: 0
-                val endX = body.get("endX")?.asInt ?: 0
-                val endY = body.get("endY")?.asInt ?: 0
-                val duration = body.get("duration")?.asLong ?: 500L
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.drag(startX, startY, endX, endY, duration)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/describe_node" -> {
-                val nodeId = body.get("nodeId")?.asString ?: ""
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.describeNode(nodeId)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/find_nodes" -> {
-                val text = body.get("text")?.asString
-                val className = body.get("className")?.asString
-                val clickable = body.get("clickable")?.asBoolean
-                val limit = body.get("limit")?.asInt ?: 20
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.findNodes(text, className, clickable, limit)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/diff_screen" -> {
-                val previousHash = body.get("previousHash")?.asString ?: ""
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.diffScreen(previousHash)
-                }
-                result to 200
-            }
-
-            method == "POST" && path == "/pinch" -> {
-                val x = body.get("x")?.asInt ?: 0
-                val y = body.get("y")?.asInt ?: 0
-                val scale = body.get("scale")?.asFloat ?: 1.5f
-                val duration = body.get("duration")?.asLong ?: 300L
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.pinch(x, y, scale, duration)
-                }
-                result to 200
-            }
-
-            method == "GET" && path == "/screen_hash" -> {
-                val result = withContext(Dispatchers.Main) {
-                    ActionExecutor.screenHash()
-                }
-                result to 200
-            }
-
-            method == "GET" && path == "/location" -> {
-                val result = ActionExecutor.location()
-                result to 200
-            }
-
-            method == "POST" && path == "/send_sms" -> {
-                val to = body.get("to")?.asString ?: ""
-                val smsBody = body.get("body")?.asString ?: ""
-                val result = ActionExecutor.sendSms(to, smsBody)
-                result to 200
-            }
-
-            method == "POST" && path == "/call" -> {
-                val number = body.get("number")?.asString ?: ""
-                val result = ActionExecutor.makeCall(number)
-                result to 200
-            }
-
-            method == "POST" && path == "/media" -> {
-                val action = body.get("action")?.asString ?: ""
-                val result = ActionExecutor.mediaControl(action)
-                result to 200
-            }
-
-            method == "GET" && path == "/events" -> {
-                val limit = params.get("limit")?.asString?.toIntOrNull() ?: 50
-                val since = params.get("since")?.asString?.toLongOrNull() ?: 0L
-                val entries = if (since > 0) {
-                    EventStore.getSince(since, limit)
-                } else {
-                    EventStore.getAll(limit)
-                }
-                val mapped = entries.map { EventStore.toMap(it) }
-                mapOf("events" to mapped, "count" to mapped.size, "streaming" to EventStore.streamingEnabled) to 200
-            }
-
-            method == "POST" && path == "/events/stream" -> {
-                val enabled = body.get("enabled")?.asBoolean ?: false
-                EventStore.setStreaming(enabled)
-                mapOf("success" to true, "streaming" to enabled) to 200
-            }
-
-            method == "GET" && path == "/contacts" -> {
-                val query = params.get("query")?.asString ?: ""
-                val limit = params.get("limit")?.asString?.toIntOrNull() ?: 20
-                val result = ActionExecutor.searchContacts(query, limit)
-                result to 200
-            }
-
-            method == "POST" && path == "/intent" -> {
-                val action = body.get("action")?.asString ?: ""
-                val dataUri = body.get("dataUri")?.asString
-                val extrasObj = body.get("extras")?.asJsonObject
-                val extras = extrasObj?.let { obj ->
-                    val map = mutableMapOf<String, String>()
-                    obj.entrySet().forEach { (k, v) -> map[k] = v.asString }
-                    map
-                }
-                val packageOverride = body.get("packageOverride")?.asString
-                val result = ActionExecutor.sendIntent(action, dataUri, extras, packageOverride)
-                result to 200
-            }
-
-            method == "POST" && path == "/broadcast" -> {
-                val action = body.get("action")?.asString ?: ""
-                val extrasObj = body.get("extras")?.asJsonObject
-                val extras = extrasObj?.let { obj ->
-                    val map = mutableMapOf<String, String>()
-                    obj.entrySet().forEach { (k, v) -> map[k] = v.asString }
-                    map
-                }
-                val result = ActionExecutor.sendBroadcast(action, extras)
-                result to 200
-            }
-
-            method == "POST" && path == "/speak" -> {
-                val text = body.get("text")?.asString ?: ""
-                val queue = body.get("queue")?.asInt ?: 1
-                val result = ActionExecutor.speak(text, queue)
-                result to 200
-            }
-
-            method == "POST" && path == "/stop_speaking" -> {
-                val result = ActionExecutor.stopSpeaking()
-                result to 200
-            }
-
-            method == "POST" && path == "/screen_record" -> {
-                val durationMs = body.get("durationMs")?.asLong ?: 5000L
-                val result = ScreenRecorder.record(durationMs)
-                result to 200
-            }
-
-            method == "GET" && path == "/widgets" -> {
-                val result = ActionExecutor.readWidgets()
-                result to 200
-            }
-
-            else -> {
-                mapOf("error" to "Unknown command: $method $path") to 404
-            }
+            ws.send(errorMessage.toString())
         }
     }
 
-    private fun countAllNodes(nodes: List<ScreenNode>): Int {
-        var count = 0
-        for (node in nodes) {
-            count += 1 + countAllNodes(node.children)
+    private fun buildStreamFrame(
+        requestId: String,
+        payload: ByteArray,
+        payloadLength: Int,
+    ): okio.ByteString {
+        val requestIdBytes = requestId.toByteArray(Charsets.UTF_8)
+        require(requestIdBytes.size in 1..128) { "request_id is too long" }
+        require(payloadLength in 0..payload.size) { "Invalid payload length" }
+
+        val frame = ByteArray(2 + requestIdBytes.size + payloadLength)
+        frame[0] = ((requestIdBytes.size ushr 8) and 0xff).toByte()
+        frame[1] = (requestIdBytes.size and 0xff).toByte()
+        requestIdBytes.copyInto(frame, destinationOffset = 2)
+        payload.copyInto(
+            frame,
+            destinationOffset = 2 + requestIdBytes.size,
+            endIndex = payloadLength,
+        )
+        return frame.toByteString()
+    }
+
+    private fun sendCommandResult(
+        ws: WebSocket,
+        requestId: String,
+        result: Any,
+        status: Int,
+    ) {
+        val response = JsonObject().apply {
+            addProperty("request_id", requestId)
+            add("result", gson.toJsonTree(result))
+            addProperty("status", status)
         }
-        return count
+        ws.send(response.toString())
     }
 
     private fun notifyStatus(connected: Boolean, message: String) {

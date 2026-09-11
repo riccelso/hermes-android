@@ -30,3 +30,15 @@ hermes-android-bridge/local.properties
 # Environment
 .env
 *.env.local
+
+# personal shared standards (symlinks to ../agent-repo-standards)
+.agents/skills
+.agents/AGENTS.base.md
+
+# local agent session state
+.pi/
+
+# CORE-OS artifacts — NEVER commit these (personal manifests, state, secrets)
+00_PROJECT_MANIFEST.md
+CORE-OS/
+*_MANIFEST.md

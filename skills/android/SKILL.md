@@ -48,15 +48,21 @@ After the user taps Connect on their phone, the phone connects to this server vi
 
 ## Available Tools
 
-You have these 14 tools. Use them by name — they are function calls.
+You have these 42 tools. Use them by name — they are function calls.
 
 ### Connectivity
 - `android_ping()` — check if phone is connected and responding
 - `android_setup(pairing_code)` — start relay and configure connection
 
 ### Reading the Screen
-- `android_read_screen(include_bounds=False)` — get the full accessibility tree as JSON. Returns every visible UI element with text, className, nodeId, clickable, etc. **Always call this before interacting.**
-- `android_screenshot()` — capture a screenshot as base64 PNG. Use when the accessibility tree doesn't show enough (canvas apps, image-heavy UIs).
+
+**Screenshots are NOT for finding UI elements.** Vision-based reading is slow,
+expensive, and unreliable for precise interaction. The accessibility tree gives
+you exact element text, node IDs, and tap targets — always use it first.
+
+- `android_read_screen(include_bounds=False)` — get the full accessibility tree as JSON. Returns every visible UI element with text, className, nodeId, clickable, etc. **Always call this before interacting. This is your default screen-reading tool.**
+- `android_find_nodes(text=..., class_name=..., clickable=True)` — search the accessibility tree for specific elements without pulling the whole tree. Use to locate a known button/field directly.
+- `android_screenshot()` — capture a screenshot as base64 PNG. **Only** for: showing the user what's on screen, verifying visual layout, or apps the accessibility tree can't see (canvas/game rendering). Never use it to search for where to tap — use `android_read_screen`, `android_find_nodes`, or `android_tap_text` instead.
 - `android_current_app()` — get the package name and activity of the foreground app.
 
 ### Opening Apps
@@ -75,10 +81,16 @@ You have these 14 tools. Use them by name — they are function calls.
 - `android_scroll(direction, node_id=None)` — scroll a specific element or the whole screen.
 
 ### Keys
-- `android_press_key(key)` — press a key. Options: `back`, `home`, `recents`, `power`, `volume_up`, `volume_down`, `enter`, `delete`, `tab`, `escape`, `search`, `notifications`
+- `android_press_key(key)` — perform a global action. Options: `back`, `home`, `recents`, `notifications`, `quick_settings`, `lock_screen`, `take_screenshot`, `wake` (turn the screen on without unlocking), `power` (opens the long-press power dialog — reboot/emergency; almost never what you want to wake the device). Volume/keyboard keys (`volume_up`, `enter`, etc.) are not supported.
 
 ### Waiting
 - `android_wait(text, class_name, timeout_ms=5000)` — poll until an element appears. Use after navigation or loading.
+
+### Microphone
+- `android_mic_record(duration=0)` — start a visible 16 kHz mono recording; `0` records until stopped, with a 30-minute safety cap.
+- `android_mic_stop()` — stop and finalize the WAV.
+- `android_mic_status()` — inspect recorder phase and completed-file metadata.
+- `android_mic_fetch(remote_path="")` — stream the latest or named WAV to a temporary `MEDIA:` file.
 
 ## Rules
 
@@ -91,9 +103,9 @@ You have these 14 tools. Use them by name — they are function calls.
 ### Workflow pattern
 For any task, follow this pattern and then STOP:
 1. `android_open_app(package)` — open the app
-2. `android_read_screen()` — see what's on screen
-3. 1-3 actions (tap, type, swipe) — do what the user asked
-4. `android_read_screen()` or `android_screenshot()` — verify the result
+2. `android_read_screen()` — see what's on screen (accessibility tree, not a screenshot)
+3. 1-3 actions (tap, type, swipe) — do what the user asked, preferring `android_tap_text` / node IDs from the tree
+4. `android_read_screen()` — verify the result (screenshot only if visual confirmation was requested)
 5. **Report to the user and STOP.** Do not take further actions unless the user asks.
 
 ### Other rules
@@ -153,6 +165,27 @@ For any task, follow this pattern and then STOP:
 8. `android_tap_text("Send")` or `android_press_key("enter")`
 
 **Pitfalls:** Message input is `android.widget.EditText`. Read screen after typing to verify before sending.
+
+### SMS / Messages — Read, draft, reply
+
+**Reading messages — use the accessibility tree, NOT screenshots.**
+Screenshot + vision loops are slow and burn tokens; the tree has the text already.
+
+1. Incoming messages arrive as notifications — `android_notifications()` returns sender + preview with no UI navigation at all. Poll it (or `android_events()`) instead of opening the app.
+2. For thread history: `android_open_app("com.google.android.apps.messaging")` → `android_tap_text("<contact>")` → `android_read_screen()`. Scroll with `android_scroll("up")` and re-read for older messages.
+3. To locate a specific message or conversation, `android_find_nodes(text="<keyword>")` is much cheaper than reading the whole screen.
+
+**Drafting without sending (review-first workflow):**
+```
+android_send_intent("android.intent.action.SENDTO",
+                    data_uri="smsto:<number>",
+                    extras={"sms_body": "<draft text>"})
+```
+This opens the compose screen pre-filled — the user reviews and hits send themselves. Prefer this over `android_send_sms` whenever the user wants to approve messages; `android_send_sms` sends immediately and must be confirmed with the user first.
+
+**Contact lookup:** `android_search_contacts("<name>")` returns numbers directly — don't navigate the Contacts app.
+
+**Pitfalls:** Default SMS app package varies (`com.google.android.apps.messaging` on Pixel, `com.samsung.android.messaging` on Samsung) — check `android_get_apps()` if open_app fails. Notification previews may be truncated; open the thread for full text.
 
 ### Spotify — Play music
 

@@ -3,7 +3,6 @@ package com.hermesandroid.bridge.notification
 import android.app.Notification
 import android.os.Bundle
 import android.service.notification.StatusBarNotification
-import java.util.concurrent.ConcurrentLinkedDeque
 
 data class NotificationEntry(
     val key: String,
@@ -17,35 +16,65 @@ data class NotificationEntry(
     val timestamp: Long,
     val isOngoing: Boolean,
     val isClearable: Boolean,
-    var removed: Boolean = false
+    val removedAt: Long? = null
 )
 
 object NotificationStore {
 
-    private val notifications = ConcurrentLinkedDeque<NotificationEntry>()
-    var maxCapacity: Int = 50
+    private val notifications = ArrayDeque<NotificationEntry>()
+    private val lock = Any()
+    @Volatile var maxCapacity: Int = 50
 
     fun add(entry: NotificationEntry) {
-        if (notifications.size >= maxCapacity) {
-            notifications.removeLast()
+        synchronized(lock) {
+            if (notifications.size >= maxCapacity) {
+                notifications.removeLast()
+            }
+            notifications.addFirst(entry)
         }
-        notifications.addFirst(entry)
     }
 
-    fun getAll(limit: Int = 50): List<NotificationEntry> {
-        return notifications.filter { !it.removed }.take(limit)
+    fun getAll(limit: Int = 50, includeRemoved: Boolean = false): List<NotificationEntry> {
+        synchronized(lock) {
+            val source = if (includeRemoved) notifications
+                else notifications.filter { it.removedAt == null }
+            return source.take(limit)
+        }
     }
 
-    fun getSince(sinceTimestamp: Long, limit: Int = 50): List<NotificationEntry> {
-        return notifications.filter { !it.removed && it.timestamp > sinceTimestamp }.take(limit)
+    fun getSince(sinceTimestamp: Long, limit: Int = 50, includeRemoved: Boolean = false): List<NotificationEntry> {
+        synchronized(lock) {
+            return notifications
+                .filter { it.timestamp > sinceTimestamp && (includeRemoved || it.removedAt == null) }
+                .take(limit)
+        }
     }
 
     fun clear() {
-        notifications.clear()
+        synchronized(lock) {
+            notifications.clear()
+        }
     }
 
     fun markRemoved(key: String) {
-        notifications.find { it.key == key }?.removed = true
+        synchronized(lock) {
+            val now = System.currentTimeMillis()
+            val idx = notifications.indexOfFirst { it.key == key }
+            if (idx >= 0) {
+                // Keep the entry (flagged as removed) so the PA can log it
+                // AFTER the user has read/cleared it — the old behaviour
+                // deleted it instantly and the 2-min poll missed the event.
+                val e = notifications[idx]
+                notifications[idx] = e.copy(removedAt = now)
+            }
+        }
+    }
+
+    /** Active (not removed) entries — the current shade. */
+    fun getActive(limit: Int = 50): List<NotificationEntry> {
+        synchronized(lock) {
+            return notifications.filter { it.removedAt == null }.take(limit)
+        }
     }
 
     fun parseNotification(sbn: StatusBarNotification): NotificationEntry? {
@@ -78,7 +107,7 @@ object NotificationStore {
     }
 
     fun toMap(entry: NotificationEntry): Map<String, Any?> {
-        return mapOf(
+        val map = mutableMapOf<String, Any?>(
             "key" to entry.key,
             "packageName" to entry.packageName,
             "title" to entry.title,
@@ -91,5 +120,10 @@ object NotificationStore {
             "isOngoing" to entry.isOngoing,
             "isClearable" to entry.isClearable
         )
+        // Only surfaced when removed entries were explicitly requested.
+        if (entry.removedAt != null) {
+            map["removedAt"] = entry.removedAt
+        }
+        return map
     }
 }

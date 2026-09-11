@@ -15,6 +15,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import com.hermesandroid.bridge.auth.PairingManager
+import com.hermesandroid.bridge.BuildConfig
 import com.hermesandroid.bridge.client.RelayClient
 import com.hermesandroid.bridge.media.ScreenRecorder
 import com.hermesandroid.bridge.overlay.StatusOverlay
@@ -38,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var switchAccessibility: Switch
     private lateinit var switchOverlay: Switch
     private lateinit var switchScreenRecord: Switch
+    private lateinit var switchRevival: Switch
     private lateinit var tvPairingCode: TextView
     private lateinit var btnRegenerate: Button
     private lateinit var etServerUrl: EditText
@@ -45,6 +47,7 @@ class MainActivity : Activity() {
     private lateinit var btnConnect: Button
     private lateinit var btnDisconnect: Button
     private lateinit var tvAddress: TextView
+    private lateinit var tvVersion: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,6 +64,7 @@ class MainActivity : Activity() {
         switchAccessibility = findViewById(R.id.switchAccessibility)
         switchOverlay = findViewById(R.id.switchOverlay)
         switchScreenRecord = findViewById(R.id.switchScreenRecord)
+        switchRevival = findViewById(R.id.switchRevival)
         tvPairingCode = findViewById(R.id.tvPairingCode)
         btnRegenerate = findViewById(R.id.btnRegenerate)
         etServerUrl = findViewById(R.id.etServerUrl)
@@ -68,6 +72,8 @@ class MainActivity : Activity() {
         btnConnect = findViewById(R.id.btnConnect)
         btnDisconnect = findViewById(R.id.btnDisconnect)
         tvAddress = findViewById(R.id.tvAddress)
+        tvVersion = findViewById(R.id.tvVersion)
+        tvVersion.text = "v${BuildConfig.VERSION_NAME}"
 
         setupPairingCode()
         setupPermissions()
@@ -89,10 +95,11 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_CODE_SCREEN_RECORD) {
             if (resultCode == RESULT_OK && data != null) {
-                val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                val projection = mpm.getMediaProjection(resultCode, data)
-                if (projection != null) {
-                    ScreenRecorder.setProjection(projection)
+                val service = BridgeAccessibilityService.instance
+                if (service == null) {
+                    Toast.makeText(this, "Enable Accessibility Service before screen recording", Toast.LENGTH_LONG).show()
+                } else {
+                    ScreenRecorder.setProjectionPermission(resultCode, data)
                     Toast.makeText(this, "Screen recording permission granted", Toast.LENGTH_SHORT).show()
                 }
             } else {
@@ -143,20 +150,43 @@ class MainActivity : Activity() {
 
         switchScreenRecord.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked && !ScreenRecorder.hasPermission()) {
-                val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                startActivityForResult(mpm.createScreenCaptureIntent(), REQUEST_CODE_SCREEN_RECORD)
+                val service = BridgeAccessibilityService.instance
+                if (service == null) {
+                    Toast.makeText(this, "Enable Accessibility Service before screen recording", Toast.LENGTH_LONG).show()
+                    updatePermissionSwitches()
+                } else {
+                    val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    startActivityForResult(mpm.createScreenCaptureIntent(), REQUEST_CODE_SCREEN_RECORD)
+                }
             }
         }
+
+        // Opt-in for the Termux auto-revival watchdog (RUN_COMMAND).
+        // Default OFF — silent script execution must be explicitly enabled.
+        switchRevival.setOnCheckedChangeListener { _, isChecked ->
+            getSharedPreferences("hermes_bridge_prefs", MODE_PRIVATE)
+                .edit().putBoolean("termux_revival_enabled", isChecked).apply()
+            Toast.makeText(
+                this,
+                if (isChecked) "Termux auto-revival ON" else "Termux auto-revival OFF",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
     }
 
     private fun updatePermissionSwitches() {
         switchAccessibility.setOnCheckedChangeListener(null)
         switchOverlay.setOnCheckedChangeListener(null)
         switchScreenRecord.setOnCheckedChangeListener(null)
+        switchRevival.setOnCheckedChangeListener(null)
 
         switchAccessibility.isChecked = BridgeAccessibilityService.instance != null
         switchOverlay.isChecked = Settings.canDrawOverlays(this)
         switchScreenRecord.isChecked = ScreenRecorder.hasPermission()
+        switchRevival.isChecked =
+            getSharedPreferences("hermes_bridge_prefs", MODE_PRIVATE)
+                .getBoolean("termux_revival_enabled", false)
 
         setupPermissions()
     }

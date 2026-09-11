@@ -104,28 +104,28 @@ object ActionExecutor {
 
         val focusedNode = service.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
 
-        if (clearFirst) {
-            val bundle = Bundle()
-            bundle.putInt(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0
-            )
-            bundle.putInt(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT,
-                focusedNode?.text?.length ?: 0
-            )
-            focusedNode?.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, bundle)
-            focusedNode?.performAction(AccessibilityNodeInfo.ACTION_CUT)
-        }
+        try {
+            if (clearFirst) {
+                val clearArgs = Bundle().apply {
+                    putCharSequence(
+                        AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, ""
+                    )
+                }
+                focusedNode?.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
+            }
 
-        val arguments = Bundle().apply {
-            putCharSequence(
-                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
-            )
+            val arguments = Bundle().apply {
+                putCharSequence(
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
+                )
+            }
+            val result = focusedNode?.performAction(
+                AccessibilityNodeInfo.ACTION_SET_TEXT, arguments
+            ) ?: false
+            ActionResult(result, if (result) "Typed text" else "No focused input found")
+        } finally {
+            focusedNode?.recycle()
         }
-        val result = focusedNode?.performAction(
-            AccessibilityNodeInfo.ACTION_SET_TEXT, arguments
-        ) ?: false
-        ActionResult(result, if (result) "Typed text" else "No focused input found")
     }
 
     suspend fun swipe(direction: String, distance: String = "medium"): ActionResult =
@@ -175,6 +175,15 @@ object ActionExecutor {
     fun pressKey(key: String): ActionResult {
         val service = BridgeAccessibilityService.instance
             ?: return ActionResult(false, "Accessibility service not running")
+
+        // "wake" turns the screen on (short press) — NOT the power dialog.
+        // GLOBAL_ACTION_POWER_DIALOG is the long-press menu (reboot/emergency),
+        // which is almost never what a caller wants when waking the device.
+        if (key == "wake") {
+            val woke = WakeLockManager.wake()
+            return ActionResult(woke, if (woke) "Woke screen" else "Wake failed (PowerManager unavailable)")
+        }
+
         val action = when (key) {
             "back" -> AccessibilityService.GLOBAL_ACTION_BACK
             "home" -> AccessibilityService.GLOBAL_ACTION_HOME
@@ -242,11 +251,15 @@ object ActionExecutor {
                         val bitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
                         hwBitmap.recycle()
                         result.hardwareBuffer.close()
+                        if (bitmap == null) {
+                            cont.resume(ActionResult(false, "Failed to copy screenshot bitmap"))
+                            return
+                        }
 
                         val w = bitmap.width
                         val h = bitmap.height
                         val stream = ByteArrayOutputStream()
-                        bitmap.compress(Bitmap.CompressFormat.JPEG, 50, stream)
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 80, stream)
                         val base64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
                         bitmap.recycle()
 
@@ -325,7 +338,7 @@ object ActionExecutor {
         val cm = service.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val clip = ClipData.newPlainText("hermes", text)
         cm.setPrimaryClip(clip)
-        return ActionResult(true, "Copied to clipboard", text)
+        return ActionResult(true, "Copied to clipboard")
     }
 
     suspend fun longPress(x: Int? = null, y: Int? = null, nodeId: String? = null, duration: Long = 500): ActionResult =
@@ -400,21 +413,24 @@ object ActionExecutor {
         if (currentHash == previousHash) {
             return ActionResult(true, "No changes detected", mapOf("changed" to false, "hash" to currentHash))
         }
-        val currentNodeIds = mutableSetOf<String>()
-        val currentTexts = mutableMapOf<String, String?>()
-        fun collectCurrent(ns: List<com.hermesandroid.bridge.model.ScreenNode>) {
-            for (n in ns) {
-                currentNodeIds.add(n.nodeId)
-                currentTexts[n.nodeId] = n.text
-                collectCurrent(n.children)
-            }
-        }
-        collectCurrent(nodes)
+        val nodeCount = countNodes(nodes)
         return ActionResult(true, "Screen changed", mapOf(
             "changed" to true,
             "hash" to currentHash,
-            "nodeCount" to currentNodeIds.size
+            "nodeCount" to nodeCount
         ))
+    }
+
+    private fun countNodes(nodes: List<com.hermesandroid.bridge.model.ScreenNode>): Int {
+        var count = 0
+        fun walk(ns: List<com.hermesandroid.bridge.model.ScreenNode>) {
+            for (n in ns) {
+                count++
+                walk(n.children)
+            }
+        }
+        walk(nodes)
+        return count
     }
 
     suspend fun pinch(x: Int, y: Int, scale: Float = 1.5f, duration: Long = 300): ActionResult =
@@ -423,14 +439,19 @@ object ActionExecutor {
             ?: return@wakeForAction ActionResult(false, "Accessibility service not running")
         val centerX = x.toFloat()
         val centerY = y.toFloat()
-        val offset = 100f * scale
+        // Perpendicular strokes on opposite sides of center along the X axis.
+        // Fingers start at ±startOff and end at ±endOff. For scale>1 (zoom in),
+        // endOff > startOff so fingers move apart; for scale<1 (zoom out),
+        // endOff < startOff so fingers move together.
+        val startOff = 50f
+        val endOff = 50f * scale
         val path1 = Path().apply {
-            moveTo(centerX - offset, centerY - offset)
-            lineTo(centerX + offset, centerY + offset)
+            moveTo(centerX - startOff, centerY)
+            lineTo(centerX - endOff, centerY)
         }
         val path2 = Path().apply {
-            moveTo(centerX + offset, centerY + offset)
-            lineTo(centerX - offset, centerY - offset)
+            moveTo(centerX + startOff, centerY)
+            lineTo(centerX + endOff, centerY)
         }
         val stroke1 = GestureDescription.StrokeDescription(path1, 0, duration)
         val stroke2 = GestureDescription.StrokeDescription(path2, 0, duration)
@@ -482,27 +503,35 @@ object ActionExecutor {
     fun location(): ActionResult {
         val service = BridgeAccessibilityService.instance
             ?: return ActionResult(false, "Accessibility service not running")
-        val lm = service.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
-        val providers = lm.getProviders(true)
-        var best: android.location.Location? = null
-        for (provider in providers) {
-            @Suppress("DEPRECATION")
-            val loc = lm.getLastKnownLocation(provider) ?: continue
-            if (best == null || loc.accuracy < best.accuracy) {
-                best = loc
+        if (!service.hasSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) &&
+            !service.hasSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)) {
+            return ActionResult(false, "Location permission not granted. Grant it in Settings > Apps > Hermes Bridge > Permissions.")
+        }
+        return try {
+            val lm = service.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
+            val providers = lm.getProviders(true)
+            var best: android.location.Location? = null
+            for (provider in providers) {
+                @Suppress("DEPRECATION")
+                val loc = lm.getLastKnownLocation(provider) ?: continue
+                if (best == null || loc.accuracy < best.accuracy) {
+                    best = loc
+                }
             }
+            if (best == null) {
+                return ActionResult(false, "No location available. Enable GPS/Location.")
+            }
+            ActionResult(true, "Location", mapOf(
+                "latitude" to best.latitude,
+                "longitude" to best.longitude,
+                "accuracy" to best.accuracy,
+                "altitude" to best.altitude,
+                "provider" to (best.provider ?: "unknown"),
+                "timestamp" to best.time
+            ))
+        } catch (e: SecurityException) {
+            ActionResult(false, "Location permission denied: ${e.message}")
         }
-        if (best == null) {
-            return ActionResult(false, "No location available. Enable GPS/Location.")
-        }
-        return ActionResult(true, "Location", mapOf(
-            "latitude" to best.latitude,
-            "longitude" to best.longitude,
-            "accuracy" to best.accuracy,
-            "altitude" to best.altitude,
-            "provider" to (best.provider ?: "unknown"),
-            "timestamp" to best.time
-        ))
     }
 
     fun sendSms(to: String, body: String): ActionResult {
@@ -519,7 +548,7 @@ object ActionExecutor {
                 SmsManager.getDefault()
             }
             smsManager.sendTextMessage(to, null, body, null, null)
-            ActionResult(true, "SMS sent to $to")
+            ActionResult(true, "SMS sent")
         } catch (e: SecurityException) {
             ActionResult(false, "SMS permission denied: ${e.message}")
         }
@@ -535,7 +564,7 @@ object ActionExecutor {
         }
         return try {
             service.startActivity(intent)
-            ActionResult(true, if (hasCallPermission) "Calling $number" else "Opened dialer for $number (grant CALL_PHONE permission to auto-dial)")
+            ActionResult(true, if (hasCallPermission) "Calling" else "Opened dialer (grant CALL_PHONE permission to auto-dial)")
         } catch (e: SecurityException) {
             ActionResult(false, "Call failed: ${e.message}")
         }
@@ -564,6 +593,7 @@ object ActionExecutor {
     }
 
     fun searchContacts(query: String, limit: Int = 20): ActionResult {
+        val safeLimit = limit.coerceAtMost(100).coerceAtLeast(1)
         val service = BridgeAccessibilityService.instance
             ?: return ActionResult(false, "Accessibility service not running")
         if (!service.hasSelfPermission(android.Manifest.permission.READ_CONTACTS)) {
@@ -571,16 +601,17 @@ object ActionExecutor {
         }
         return try {
             val results = mutableListOf<Map<String, String?>>()
-            val uri = android.net.Uri.withAppendedPath(android.provider.ContactsContract.Contacts.CONTENT_FILTER_URI, query)
+            val safeQuery = android.net.Uri.encode(query)
+            val uri = android.net.Uri.withAppendedPath(android.provider.ContactsContract.Contacts.CONTENT_FILTER_URI, safeQuery)
             val projection = arrayOf(
                 android.provider.ContactsContract.Contacts._ID,
                 android.provider.ContactsContract.Contacts.DISPLAY_NAME
             )
-            val cursor = service.contentResolver.query(uri, projection, null, null, "${android.provider.ContactsContract.Contacts.DISPLAY_NAME} ASC LIMIT $limit")
+            val cursor = service.contentResolver.query(uri, projection, null, null, "${android.provider.ContactsContract.Contacts.DISPLAY_NAME} ASC")
             cursor?.use {
                 val idIdx = it.getColumnIndex(android.provider.ContactsContract.Contacts._ID)
                 val nameIdx = it.getColumnIndex(android.provider.ContactsContract.Contacts.DISPLAY_NAME)
-                while (it.moveToNext()) {
+                while (it.moveToNext() && results.size < safeLimit) {
                     val contactId = it.getString(idIdx) ?: continue
                     val name = it.getString(nameIdx) ?: continue
                     val phoneNumbers = mutableListOf<String>()
@@ -613,9 +644,86 @@ object ActionExecutor {
     fun sendIntent(action: String, dataUri: String? = null, extras: Map<String, String>? = null, packageOverride: String? = null): ActionResult {
         val service = BridgeAccessibilityService.instance
             ?: return ActionResult(false, "Accessibility service not running")
+
+        // Reject activity-launch actions that could be used to install/uninstall
+        // packages, factory reset, or otherwise damage the device. These have no
+        // legitimate agent use case via a raw intent (the dedicated call/send_sms
+        // tools cover telephony, and settings can be navigated to via open_app).
+        // Custom namespace actions (containing a dot) are NOT exempt here, because
+        // package-manager actions like android.intent.action.DELETE are also dotted.
+        val blockedIntents = setOf(
+            // Package management — install/uninstall from arbitrary sources
+            "android.intent.action.INSTALL_PACKAGE",
+            "android.intent.action.DELETE",
+            "android.intent.action.UNINSTALL_PACKAGE",
+            "android.intent.action.PACKAGE_INSTALL",
+            // Device wipe / factory reset
+            "android.intent.action.MASTER_CLEAR",
+            "android.intent.action.FACTORY_RESET",
+            "android.intent.action.ACTION_SHUTDOWN",
+            // Telephony — direct dial without confirmation
+            "android.intent.action.CALL",
+            "android.intent.action.CALL_PRIVILEGED",
+            // Dangerous settings toggles — permissions, accessibility, dev options
+            "android.settings.ACCESSIBILITY_SETTINGS",
+            "android.settings.APPLICATION_DETAILS_SETTINGS",
+            "android.settings.APPLICATION_DEVELOPMENT_SETTINGS",
+            "android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION",
+            "android.settings.MANAGE_UNKNOWN_APP_SOURCES",
+            "android.settings.MANAGE_OVERLAY_PERMISSION",
+            "android.settings.action.MANAGE_OVERLAY_PERMISSION",
+            "android.settings.NOTIFICATION_LISTENER_SETTINGS",
+            "android.settings.USAGE_ACCESS_SETTINGS",
+            "android.settings.VR_LISTENER_SETTINGS",
+            "android.settings.WIFI_SETTINGS",
+            "android.settings.WIRELESS_SETTINGS",
+            "android.settings.AIRPLANE_MODE_SETTINGS",
+            "android.settings.DATA_ROAMING_SETTINGS",
+            "android.settings.SECURITY_SETTINGS",
+            "android.settings.PRIVACY_SETTINGS",
+            "android.settings.BIOMETRIC_ENROLL",
+            "android.settings.ADD_ACCOUNT_SETTINGS",
+            "android.settings.SYNC_SETTINGS",
+            // Unknown app sources (alternate action name)
+            "android.provider.action.MANAGE_UNKNOWN_APP_SOURCES",
+            // App ops — can grant dangerous permissions
+            "android.settings.APP_OPS_SETTINGS"
+        )
+        // Block any android.settings.* action that isn't explicitly allowlisted
+        val blockedPrefixes = listOf(
+            "android.settings.",
+            "android.provider.action."
+        )
+        if (action.isBlank()) {
+            return ActionResult(false, "Intent action is empty")
+        }
+        if (action in blockedIntents) {
+            return ActionResult(false, "Intent action '$action' is blocked for safety")
+        }
+        if (blockedPrefixes.any { action.startsWith(it) }) {
+            return ActionResult(false, "Intent action '$action' is blocked for safety (settings/provider actions are not allowed)")
+        }
+
         val intent = Intent(action).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             if (dataUri != null) {
+                // Denylist dangerous URI schemes that can bypass the action blocklist.
+                // An attacker can use a benign action like VIEW with a malicious URI
+                // (intent:// redirects, content:// providers, market:// deep links,
+                //  tel:, smsto:, mmsto:).
+                val blockedUriSchemes = setOf("intent", "market", "smsto", "mmsto", "tel")
+                val blockedUriPrefixes = listOf("content://settings", "content://com.android.contacts")
+                // Handle both standard schemes (http://, intent://) and single-colon
+                // schemes (tel:, smsto:, mmsto:). substringBefore("://") alone fails
+                // for single-colon URIs because "://" is absent, returning the full
+                // string (e.g. "tel:123456") instead of just "tel".
+                val scheme = dataUri.substringBefore("://").substringBefore(":").lowercase()
+                if (scheme in blockedUriSchemes) {
+                    return ActionResult(false, "URI scheme '$scheme' is blocked for safety")
+                }
+                if (blockedUriPrefixes.any { dataUri.lowercase().startsWith(it) }) {
+                    return ActionResult(false, "Content provider URI is blocked for safety")
+                }
                 setData(android.net.Uri.parse(dataUri))
             }
             extras?.forEach { (key, value) ->
@@ -636,6 +744,33 @@ object ActionExecutor {
     fun sendBroadcast(action: String, extras: Map<String, String>? = null): ActionResult {
         val service = BridgeAccessibilityService.instance
             ?: return ActionResult(false, "Accessibility service not running")
+
+        // Block known-dangerous system broadcasts that can cause DoS or abuse
+        // device resources when fired from an unprivileged bridge context.
+        // Custom namespace actions (containing a dot) are allowed.
+        val blockedBroadcasts = setOf(
+            "android.intent.action.MEDIA_MOUNTED",
+            "android.intent.action.MEDIA_UNMOUNTED",
+            "android.intent.action.MEDIA_EJECT",
+            "android.intent.action.MEDIA_SCANNER_FINISHED",
+            "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+            "android.intent.action.PACKAGE_ADDED",
+            "android.intent.action.PACKAGE_REMOVED",
+            "android.intent.action.PACKAGE_REPLACED",
+            "android.intent.action.PACKAGE_DATA_CLEARED",
+            "android.intent.action.DEVICE_STORAGE_LOW",
+            "android.intent.action.DEVICE_STORAGE_OK",
+            "android.intent.action.ACTION_SHUTDOWN",
+            "android.intent.action.MASTER_CLEAR",
+            "android.intent.action.FACTORY_RESET"
+        )
+        if (action.isBlank()) {
+            return ActionResult(false, "Broadcast action is empty")
+        }
+        if (action in blockedBroadcasts) {
+            return ActionResult(false, "Broadcast action '$action' is blocked for safety")
+        }
+
         return try {
             val intent = Intent(action)
             extras?.forEach { (key, value) -> intent.putExtra(key, value) }
@@ -662,21 +797,32 @@ object ActionExecutor {
 
     private fun findNodeById(nodeId: String): AccessibilityNodeInfo? {
         val service = BridgeAccessibilityService.instance ?: return null
-        val roots = service.windows.mapNotNull { it.root }
+        val windows = service.windows
+        val roots = windows.mapNotNull { it.root }
         var found: AccessibilityNodeInfo? = null
         for ((wi, root) in roots.withIndex()) {
             val matches = findNodeByIdInTree(root, nodeId, "$wi")
             if (matches.isNotEmpty()) {
                 found = matches.first()
+                if (found !== roots[wi]) roots[wi].recycle()
                 for (r in roots.subList(wi + 1, roots.size)) r.recycle()
                 break
             }
             root.recycle()
         }
+        windows.forEach { it.recycle() }
         return found
     }
 
-    /** DFS search matching the stable ID format from ScreenReader.buildNode */
+    /**
+     * DFS search matching the stable ID format from ScreenReader.buildNode.
+     *
+     * Memory contract: the returned node(s) are intentionally NOT recycled — the caller
+     * owns them and must recycle when done. Unmatched child nodes traversed during the
+     * DFS are recycled, including intermediate ancestors on the path to a match.
+     * Siblings after the first match are skipped
+     * (early break) and left for the system to reclaim.
+     */
     private fun findNodeByIdInTree(
         info: AccessibilityNodeInfo, targetId: String, path: String
     ): List<AccessibilityNodeInfo> {
@@ -690,6 +836,8 @@ object ActionExecutor {
             val found = findNodeByIdInTree(child, targetId, "${path}_$i")
             if (found.isNotEmpty()) {
                 results.addAll(found)
+                // Recycle the intermediate ancestor unless the child itself is a match
+                if (found.none { it === child }) child.recycle()
                 break
             } else {
                 child.recycle()
@@ -709,12 +857,14 @@ object ActionExecutor {
         service.startActivity(homeIntent)
         delay(1000)
 
-        val roots = service.windows.mapNotNull { it.root }
+        val windows = service.windows
+        val roots = windows.mapNotNull { it.root }
         val widgets = mutableListOf<Map<String, Any?>>()
         for (root in roots) {
             collectWidgetInfo(root, widgets, 0)
             root.recycle()
         }
+        windows.forEach { it.recycle() }
 
         return ActionResult(true, "Found ${widgets.size} widget elements", mapOf("widgets" to widgets, "count" to widgets.size))
     }
@@ -759,23 +909,24 @@ object ActionExecutor {
         return null
     }
 
-    private var tts: android.speech.tts.TextToSpeech? = null
-    private var ttsReady = false
+    @Volatile private var tts: android.speech.tts.TextToSpeech? = null
+    @Volatile private var ttsReady = false
 
-    private fun ensureTts(): Boolean {
+    private suspend fun ensureTts(): Boolean {
         val service = BridgeAccessibilityService.instance ?: return false
         if (tts == null || !ttsReady) {
-            val latch = java.util.concurrent.CountDownLatch(1)
-            tts = android.speech.tts.TextToSpeech(service.applicationContext, android.speech.tts.TextToSpeech.OnInitListener {
-                ttsReady = it == android.speech.tts.TextToSpeech.SUCCESS
-                latch.countDown()
-            })
-            latch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            ttsReady = suspendCancellableCoroutine { cont ->
+                tts = android.speech.tts.TextToSpeech(service.applicationContext, android.speech.tts.TextToSpeech.OnInitListener { status ->
+                    val ready = status == android.speech.tts.TextToSpeech.SUCCESS
+                    ttsReady = ready
+                    cont.resume(ready)
+                })
+            }
         }
         return ttsReady
     }
 
-    fun speak(text: String, queue: Int = android.speech.tts.TextToSpeech.QUEUE_ADD): ActionResult {
+    suspend fun speak(text: String, queue: Int = android.speech.tts.TextToSpeech.QUEUE_ADD): ActionResult {
         if (!ensureTts()) {
             return ActionResult(false, "TTS not available")
         }
@@ -786,6 +937,12 @@ object ActionExecutor {
     fun stopSpeaking(): ActionResult {
         tts?.stop()
         return ActionResult(true, "Stopped speaking")
+    }
+
+    fun shutdownTts() {
+        tts?.shutdown()
+        tts = null
+        ttsReady = false
     }
 
     private fun Context.hasSelfPermission(permission: String): Boolean {
